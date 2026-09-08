@@ -1,0 +1,674 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==================================================
+// USERS & WORKSPACES (Foundation)
+// ==================================================
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  name         String?
+  passwordHash String?
+  role         String    @default("MEMBER") // ADMIN, MANAGER, MEMBER
+  avatarUrl    String?
+  workspaceId  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  
+  ownedWorkspaces Workspace[] @relation("WorkspaceOwner")
+  workspace       Workspace?  @relation("WorkspaceMembers", fields: [workspaceId], references: [id])
+  mailboxes       Mailbox[]
+  campaigns       Campaign[]
+}
+
+model Workspace {
+  id        String   @id @default(uuid())
+  name      String
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  user      User     @relation("WorkspaceOwner", fields: [userId], references: [id])
+  members   User[]   @relation("WorkspaceMembers")
+  
+  organizations   Organization[]
+  contacts        Contact[]
+  lists           List[]
+  campaigns       Campaign[]
+  mailboxes       Mailbox[]
+  activityLogs    ActivityLog[]
+}
+
+// ==================================================
+// ORGANIZATIONS & CONTACTS (CRM Base)
+// ==================================================
+
+model Organization {
+  id                     String   @id @default(uuid())
+  workspaceId            String
+  name                   String
+  domain                 String?
+  websiteUrl             String?
+  industry               String?
+  employeeSize           String?
+  employeeCount          Int?
+  phone                  String?
+  city                   String?
+  state                  String?
+  country                String?
+  linkedinUrl            String?
+  annualTravelEstimate   String?
+  monthlyTravelVolume    String?
+  currentTravelMethod    String?
+  currentExpenseMethod   String?
+  icpSegment             String?
+  accountStatus          String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  contacts  Contact[]
+  conversations Conversation[]
+
+  @@unique([workspaceId, domain])
+}
+
+model Contact {
+  id                     String   @id @default(uuid())
+  workspaceId            String
+  organizationId         String?
+  firstName              String?
+  lastName               String?
+  fullName               String?
+  jobTitle               String?
+  department             String?
+  seniority              String?
+  linkedinUrl            String?
+  phone                  String?
+  whatsappNumber         String?
+  city                   String?
+  country                String?
+  personalizedLine           String?
+  personalizationTrigger     String?
+  personalizationStatus      String?   @default("PENDING") // PENDING, GENERATING, GENERATED, NO_USEFUL_DATA, FAILED
+  personalizationSource      String?   @default("AI_RESEARCH") // AI_RESEARCH, MANUAL
+  personalizationGeneratedAt DateTime?
+  personalizationUpdatedAt   DateTime?
+  personalizationConfidence   String?   // HIGH, MEDIUM, LOW
+  personalizationEvidence     Json?
+  ownerName                  String?
+  lifecycleStage             String?
+  leadStatus                 String?
+  doNotContact               Boolean  @default(false)
+  unsubscribeAt              DateTime?
+  notes                  String?
+  source                 String?
+  sourceRecordId         String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  workspace       Workspace       @relation(fields: [workspaceId], references: [id])
+  organization    Organization?   @relation(fields: [organizationId], references: [id])
+  
+  emails          ContactEmail[]
+  listMemberships ListMember[]
+  enrollments     Enrollment[]
+  emailMessages   EmailMessage[]
+  emailEvents     EmailEvent[]
+  conversations   Conversation[]
+  conversationActions ConversationAction[]
+}
+
+model ContactEmail {
+  id                 String   @id @default(uuid())
+  contactId          String
+  email              String
+  normalizedEmail    String
+  emailType          String?  // work, personal, etc.
+  verificationStatus String?  // verified, likely_valid, risky, invalid, bounced
+  isPrimary          Boolean  @default(false)
+  isValid            Boolean  @default(true)
+  bounceCount        Int      @default(0)
+  lastBouncedAt      DateTime?
+  createdAt          DateTime @default(now())
+
+  contact Contact @relation(fields: [contactId], references: [id])
+  
+  @@unique([contactId, normalizedEmail])
+}
+
+// ==================================================
+// LISTS & SEGMENTATION
+// ==================================================
+
+model List {
+  id          String   @id @default(uuid())
+  workspaceId String
+  name        String
+  description String?
+  listType    String   // static, dynamic, suppression
+  rules       Json?    // dynamic list evaluation rules
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  members   ListMember[]
+  campaigns Campaign[]
+}
+
+model ListMember {
+  id               String   @id @default(uuid())
+  listId           String
+  contactId        String
+  addedBy          String?
+  membershipStatus String   @default("active") // active, paused, removed, unsubscribed
+  addedAt          DateTime @default(now())
+
+  list    List    @relation(fields: [listId], references: [id])
+  contact Contact @relation(fields: [contactId], references: [id])
+
+  @@unique([listId, contactId])
+}
+
+model SuppressionList {
+  id              String   @id @default(uuid())
+  email           String
+  normalizedEmail String   @unique
+  reason          String   // unsubscribe, hard_bounce, spam_complaint, do_not_contact
+  source          String?
+  notes           String?
+  suppressedAt    DateTime @default(now())
+  expiresAt       DateTime?
+}
+
+// ==================================================
+// CAMPAIGNS & SEQUENCES
+// ==================================================
+
+model Campaign {
+  id                       String   @id @default(uuid())
+  workspaceId              String
+  userId                   String?
+  listId                   String?
+  name                     String
+  campaignCode             String?
+  description              String?
+  campaignType             String   @default("email_outreach")
+  audienceType             String   @default("list")
+  owner                    String?
+  status                   String   @default("draft") // draft, active, paused, completed
+  approvalStatus           String   @default("DRAFT") // DRAFT, PENDING_APPROVAL, APPROVED
+  
+  senderMailboxes          String[]
+  replyToEmail             String?
+  
+  dailySendLimit           Int      @default(100)
+  hourlySendLimit          Int      @default(20)
+  delayBetweenSendsSeconds Int      @default(180)
+  
+  timezone                 String   @default("UTC")
+  sendingDays              Json?    // e.g. ["Mon", "Tue", "Wed", "Thu", "Fri"]
+  sendingWindowStart       String?  // e.g. "09:30"
+  sendingWindowEnd         String?  // e.g. "17:30"
+  
+  stopOnReply              Boolean  @default(true)
+  openTracking             Boolean  @default(true)
+  
+  startAt                  DateTime?
+  endAt                    DateTime?
+  landingPageUrl           String?
+  utmCampaign              String?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  user      User?     @relation(fields: [userId], references: [id])
+  list      List?     @relation(fields: [listId], references: [id])
+  
+  sequences   Sequence[]
+  enrollments Enrollment[]
+  messages    EmailMessage[]
+  events      EmailEvent[]
+  conversions Conversion[]
+  conversations Conversation[]
+  auditLogs   AuditLog[]
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  campaignId  String
+  userId      String?
+  action      String
+  details     String?
+  createdAt   DateTime @default(now())
+  
+  campaign    Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+model Sequence {
+  id                   String   @id @default(uuid())
+  campaignId           String
+  name                 String
+  description          String?
+  sequenceType         String   @default("COLD_OUTREACH")
+  status               String   @default("active")
+  stopOnReply          Boolean  @default(true)
+  stopOnBounce         Boolean  @default(true)
+  stopOnUnsubscribe    Boolean  @default(true)
+  stopOnRegistration   Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id])
+  steps    SequenceStep[]
+  enrollments Enrollment[]
+  conversations Conversation[]
+}
+
+model SequenceStep {
+  id                 String   @id @default(uuid())
+  sequenceId         String
+  stepNumber         Int
+  stepName           String?
+  stepType           String   @default("email") // email, linkedin, call
+  delayDays          Int      @default(1)
+  subjectTemplate    String?
+  bodyTemplate       String?
+  bodyHtmlTemplate   String?
+  senderName         String?
+  senderEmail        String?
+  replyToEmail       String?
+  includeTracking    Boolean  @default(true)
+  includeUnsubscribe Boolean  @default(true)
+  active             Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  sequence Sequence @relation(fields: [sequenceId], references: [id])
+  messages EmailMessage[]
+}
+
+model Enrollment {
+  id             String   @id @default(uuid())
+  campaignId     String
+  sequenceId     String
+  contactId      String
+  status         String   @default("pending") // pending, active, paused, completed, replied, bounced
+  currentStep    Int      @default(1)
+  nextSendAt     DateTime?
+  enrolledAt     DateTime @default(now())
+  startedAt      DateTime?
+  lastSentAt     DateTime?
+  completedAt    DateTime?
+  pausedAt       DateTime?
+  pauseReason    String?
+  stoppedAt      DateTime?
+  stopReason     String?
+  assignedTo     String?
+  sendAttempts   Int      @default(0)
+  failureCount   Int      @default(0)
+  lastError      String?
+  lockedAt       DateTime?
+  lockedBy       String?
+  lockExpiresAt  DateTime?
+  retryCount     Int      @default(0)
+  lastRetryAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id])
+  sequence Sequence @relation(fields: [sequenceId], references: [id])
+  contact  Contact  @relation(fields: [contactId], references: [id])
+  messages EmailMessage[]
+  events   EmailEvent[]
+  conversations Conversation[]
+
+  @@unique([campaignId, contactId])
+}
+
+// ==================================================
+// MAILBOXES & MESSAGES
+// ==================================================
+
+model Mailbox {
+  id                 String   @id @default(uuid())
+  workspaceId        String?
+  userId             String?
+  ownerName          String?
+
+  email              String   @unique
+  displayName        String?
+
+  provider           String   // GOOGLE, MICROSOFT, SMTP_IMAP, RESEND, etc
+  connectionType     String   // OAUTH, SMTP_IMAP, API_KEY
+
+  status             String   @default("DISCONNECTED")
+
+  smtpStatus         String   @default("NOT_CONFIGURED")
+  imapStatus         String   @default("NOT_CONFIGURED")
+  replySyncStatus    String   @default("INACTIVE")
+
+  dailySendLimit     Int      @default(25)
+  hourlySendLimit    Int      @default(5)
+
+  emailsSentToday    Int      @default(0)
+  emailsSentThisHour Int      @default(0)
+
+  sendingTimezone    String   @default("Asia/Kolkata")
+  sendingDays        Json     @default("[\"MON\",\"TUE\",\"WED\",\"THU\",\"FRI\"]")
+  sendingStartTime   String   @default("09:30:00")
+  sendingEndTime     String   @default("17:30:00")
+
+  warmupStatus       String   @default("UNKNOWN")
+
+  lastSentAt         DateTime?
+  lastReplySyncAt    DateTime?
+  lastTestedAt       DateTime?
+
+  nextAvailableSendAt DateTime?
+
+  lastError          String?
+
+  isActive           Boolean  @default(true)
+  isDefault          Boolean  @default(false)
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  user      User?      @relation(fields: [userId], references: [id])
+  threads   EmailThread[]
+  credentials MailboxCredential?
+  conversations Conversation[]
+}
+
+model MailboxCredential {
+  id                      String   @id @default(uuid())
+  mailboxId               String   @unique
+
+  encryptedAccessToken    String?
+  encryptedRefreshToken   String?
+  accessTokenExpiresAt    DateTime?
+
+  encryptedSmtpHost       String?
+  encryptedSmtpPort       String?
+  encryptedSmtpUsername   String?
+  encryptedSmtpPassword   String?
+
+  encryptedImapHost       String?
+  encryptedImapPort       String?
+  encryptedImapUsername   String?
+  encryptedImapPassword   String?
+
+  encryptedApiKey         String?
+
+  encryptionVersion       String   @default("v1")
+
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  mailbox                 Mailbox  @relation(fields: [mailboxId], references: [id], onDelete: Cascade)
+}
+
+model EmailThread {
+  id             String   @id @default(uuid())
+  mailboxId      String
+  subject        String
+  startedAt      DateTime @default(now())
+  lastMessageAt  DateTime @default(now())
+  status         String   @default("active")
+
+  mailbox  Mailbox        @relation(fields: [mailboxId], references: [id])
+  messages EmailMessage[]
+}
+
+model EmailMessage {
+  id                String   @id @default(uuid())
+  enrollmentId      String?
+  contactId         String?
+  campaignId        String?
+  sequenceStepId    String?
+  threadId          String?
+  provider          String?
+  providerMessageId String?  @unique
+  fromEmail         String
+  toEmail           String
+  subject           String
+  bodyText          String?
+  bodyHtml          String?
+  status            String   // queued, sent, delivered, bounced, failed
+  
+  idempotencyKey    String?  @unique
+  attemptCount      Int      @default(0)
+  lastAttemptAt     DateTime?
+  deliveredAt       DateTime?
+  failedAt          DateTime?
+  failureReason     String?
+  trackingToken     String?  @unique
+
+  sentAt            DateTime?
+  openedAt          DateTime?
+  clickedAt         DateTime?
+  bouncedAt         DateTime?
+  complainedAt      DateTime?
+  repliedAt         DateTime?
+  lastEventAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  enrollment   Enrollment?   @relation(fields: [enrollmentId], references: [id])
+  contact      Contact?      @relation(fields: [contactId], references: [id])
+  campaign     Campaign?     @relation(fields: [campaignId], references: [id])
+  sequenceStep SequenceStep? @relation(fields: [sequenceStepId], references: [id])
+  thread       EmailThread?  @relation(fields: [threadId], references: [id])
+  
+  events       EmailEvent[]
+  links        EmailLink[]
+  conversationMessages ConversationMessage[]
+}
+
+model EmailEvent {
+  id                String   @id @default(uuid())
+  emailMessageId    String
+  contactId         String?
+  campaignId        String?
+  provider          String?
+  providerEventId   String?  @unique
+  eventType         String   // sent, delivered, opened, clicked, replied, bounced
+  metadata          Json?
+  eventAt           DateTime @default(now())
+  createdAt         DateTime @default(now())
+  
+  enrollmentId      String?
+  receivedAt        DateTime?
+  recipientEmail    String?
+  senderEmail       String?
+  providerMessageId String?
+  providerThreadId  String?
+  linkUrl           String?
+  linkToken         String?
+  emailLinkId       String?
+  ipAddress         String?
+  userAgent         String?
+  rawPayload        Json?    @default("{}")
+  processed         Boolean  @default(false)
+  processedAt       DateTime?
+  processingError   String?
+
+  message  EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+  link     EmailLink?   @relation(fields: [emailLinkId], references: [id], onDelete: SetNull)
+  contact  Contact?     @relation(fields: [contactId], references: [id])
+  campaign Campaign?    @relation(fields: [campaignId], references: [id])
+  enrollment Enrollment? @relation(fields: [enrollmentId], references: [id])
+}
+
+model EmailLink {
+  id              String   @id @default(uuid())
+  emailMessageId  String
+  trackingToken   String   @unique
+  destinationUrl  String
+  linkText        String?
+  linkType        String   @default("BODY_LINK")
+  clickCount      Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  message         EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+  events          EmailEvent[]
+
+  @@index([trackingToken])
+  @@index([emailMessageId])
+}
+
+// ==================================================
+// CONVERSIONS & LOGS
+// ==================================================
+
+model Conversion {
+  id               String   @id @default(uuid())
+  campaignId       String?
+  contactId        String?
+  conversionType   String   // registered, activated, booked
+  conversionValue  Float?
+  currency         String?
+  source           String?
+  attributionData  Json?
+  occurredAt       DateTime @default(now())
+  createdAt        DateTime @default(now())
+
+  campaign Campaign? @relation(fields: [campaignId], references: [id])
+}
+
+model ActivityLog {
+  id          String   @id @default(uuid())
+  workspaceId String
+  action      String   // contact_imported, campaign_created, etc
+  description String?
+  entityType  String?
+  entityId    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+}
+
+// ==================================================
+// UNIBOX CONVERSATIONS (Phase 10)
+// ==================================================
+
+model Conversation {
+  id                         String   @id @default(uuid())
+  mailboxId                  String?
+  contactId                  String?
+  organizationId             String?
+  campaignId                 String?
+  sequenceId                 String?
+  enrollmentId               String?
+  providerThreadId           String?
+  internetMessageThreadId    String?
+  subject                    String?
+  status                     String   @default("OPEN")
+  priority                   String   @default("NORMAL")
+  assignedTo                 String?
+  assignedAt                 DateTime?
+  latestMessageAt            DateTime?
+  latestMessagePreview       String?
+  latestMessageDirection     String?
+  lastInboundAt              DateTime?
+  lastOutboundAt             DateTime?
+  unreadCount                Int      @default(0)
+  lastReadAt                 DateTime?
+  replyRequired              Boolean  @default(false)
+  replyDueAt                 DateTime?
+  interestStatus             String   @default("UNKNOWN")
+  replyClassification        String?
+  archivedAt                 DateTime?
+  closedAt                   DateTime?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @default(now())
+
+  mailbox       Mailbox?       @relation(fields: [mailboxId], references: [id])
+  contact       Contact?       @relation(fields: [contactId], references: [id])
+  organization  Organization?  @relation(fields: [organizationId], references: [id])
+  campaign      Campaign?      @relation(fields: [campaignId], references: [id])
+  sequence      Sequence?      @relation(fields: [sequenceId], references: [id])
+  enrollment    Enrollment?    @relation(fields: [enrollmentId], references: [id])
+
+  messages      ConversationMessage[]
+  actions       ConversationAction[]
+}
+
+model ConversationMessage {
+  id                   String   @id @default(uuid())
+  conversationId       String
+  emailMessageId       String?
+  providerMessageId    String?
+  internetMessageId    String?
+  inReplyToMessageId   String?
+  direction            String
+  messageType          String   @default("EMAIL")
+  senderName           String?
+  senderEmail          String?
+  recipientEmails      Json     @default("[]")
+  subject              String?
+  bodyText             String?
+  bodyHtml             String?
+  isRead               Boolean  @default(false)
+  readAt               DateTime?
+  sentAt               DateTime?
+  receivedAt           DateTime?
+  createdBy            String?
+  attachments          Json     @default("[]")
+  metadata             Json     @default("{}")
+  createdAt            DateTime @default(now())
+
+  conversation  Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  emailMessage  EmailMessage? @relation(fields: [emailMessageId], references: [id])
+}
+
+model ConversationAction {
+  id              String   @id @default(uuid())
+  conversationId  String
+  contactId       String?
+  actionType      String
+  performedBy     String?
+  previousValue   Json?
+  newValue        Json?
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  conversation  Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  contact       Contact?     @relation(fields: [contactId], references: [id])
+}
+
+model SchedulerRun {
+  id               String   @id @default(uuid())
+  workerId         String?
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+  campaignsChecked Int      @default(0)
+  enrollmentsFound Int      @default(0)
+  emailsSent       Int      @default(0)
+  emailsSkipped    Int      @default(0)
+  emailsFailed     Int      @default(0)
+  retriesScheduled Int      @default(0)
+  metadata         Json?
+}
+
+model PersonalizationJob {
+  id          String    @id @default(uuid())
+  workspaceId String
+  status      String    @default("PENDING") // PENDING, PROCESSING, COMPLETED, FAILED
+  total       Int       @default(0)
+  processed   Int       @default(0)
+  successful  Int       @default(0)
+  failed      Int       @default(0)
+  contactIds  Json      // array of contact IDs
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
