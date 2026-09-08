@@ -4,9 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "prisma generate && tsc",
+    "start": "node dist/src/index.js",
     "dev": "nodemon src/index.ts",
-    "postinstall": "prisma skills sync || exit 0"
+    "test": "ts-node tests/rotationService.test.ts",
+    "postinstall": "prisma generate"
   },
   "keywords": [],
   "author": "",

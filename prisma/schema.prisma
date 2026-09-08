@@ -326,11 +326,14 @@ model Enrollment {
   campaign Campaign @relation(fields: [campaignId], references: [id])
   sequence Sequence @relation(fields: [sequenceId], references: [id])
   contact  Contact  @relation(fields: [contactId], references: [id])
+  mailboxId String?
+  mailbox   Mailbox? @relation(fields: [mailboxId], references: [id])
   messages EmailMessage[]
   events   EmailEvent[]
   conversations Conversation[]
 
   @@unique([campaignId, contactId])
+  @@index([campaignId, mailboxId])
 }
 
 // ==================================================
@@ -387,6 +390,7 @@ model Mailbox {
   threads   EmailThread[]
   credentials MailboxCredential?
   conversations Conversation[]
+  enrollments Enrollment[]
 }
 
 model MailboxCredential {

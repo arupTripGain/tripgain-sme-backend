@@ -3,6 +3,19 @@ import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import Handlebars from 'handlebars';
 import { decrypt } from '../controllers/mailboxController';
+import {
+  getCalendarBucketBounds,
+  isWithinSendingWindow,
+  getDispatchedMessageCounts,
+  calculateEffectiveCapacity,
+  hashStringTo32BitInt
+} from './quotaService';
+import {
+  getCampaignAssignedMailboxes,
+  resolveEligibleMailboxes,
+  getCampaignEnrollmentCountsByMailbox,
+  selectFairMailbox
+} from './rotationService';
 
 const prisma = new PrismaClient();
 
@@ -43,28 +56,57 @@ async function shouldStopBeforeSend(enrollmentId: string): Promise<{ stop: boole
 }
 
 // ---------------------------------------------------------------------
-// Capacity Check
+// Two-Tier Hierarchical Capacity & Window Check
 // ---------------------------------------------------------------------
-async function getMailboxCapacity(mailboxId: string, force = false) {
-  const mailbox = await prisma.mailbox.findUnique({ where: { id: mailboxId } });
-  if (!mailbox) return { availableNow: 0, remainingDaily: 0, remainingHourly: 0 };
-  
-  const remainingDaily = Math.max(0, mailbox.dailySendLimit - mailbox.emailsSentToday);
-  const remainingHourly = Math.max(0, mailbox.hourlySendLimit - mailbox.emailsSentThisHour);
-  
+async function getEffectiveCapacity(mailbox: any, campaign: any, force = false) {
   if (force) {
     return {
-      remainingDaily: Math.max(remainingDaily, 50),
-      remainingHourly: Math.max(remainingHourly, 50),
-      availableNow: Math.max(Math.min(remainingDaily, remainingHourly), 50)
+      availableCapacity: 50,
+      skipReason: null,
+      mailboxRemainingHourly: 50,
+      mailboxRemainingDaily: 50,
+      campaignRemainingHourly: 50,
+      campaignRemainingDaily: 50
     };
   }
 
-  return {
-    remainingDaily,
-    remainingHourly,
-    availableNow: Math.min(remainingDaily, remainingHourly)
-  };
+  // 1. Enforce sending window (sendingDays, sendingStartTime, sendingEndTime in sendingTimezone)
+  const windowCheck = isWithinSendingWindow(mailbox);
+  if (!windowCheck.inWindow) {
+    return {
+      availableCapacity: 0,
+      skipReason: windowCheck.reason || 'OUTSIDE_SENDING_WINDOW',
+      mailboxRemainingHourly: 0,
+      mailboxRemainingDaily: 0,
+      campaignRemainingHourly: 0,
+      campaignRemainingDaily: 0
+    };
+  }
+
+  // 2. Derive exact calendar-hour and calendar-day bounds based on mailbox.sendingTimezone
+  const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
+
+  // 3. Ground-truth query of successfully dispatched outbound messages
+  const counts = await getDispatchedMessageCounts({
+    mailboxEmail: mailbox.email,
+    campaignId: campaign.id,
+    startOfHour: bounds.startOfHour,
+    endOfHour: bounds.endOfHour,
+    startOfDay: bounds.startOfDay,
+    endOfDay: bounds.endOfDay
+  });
+
+  // 4. Calculate effective capacity respecting both mailbox and campaign ceilings
+  return calculateEffectiveCapacity({
+    mailboxHourlyLimit: mailbox.hourlySendLimit,
+    mailboxDailyLimit: mailbox.dailySendLimit,
+    mailboxSentThisHour: counts.mailboxSentThisHour,
+    mailboxSentToday: counts.mailboxSentToday,
+    campaignHourlyLimit: campaign.hourlySendLimit,
+    campaignDailyLimit: campaign.dailySendLimit,
+    campaignSentThisHour: counts.campaignSentThisHour,
+    campaignSentToday: counts.campaignSentToday
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -98,74 +140,191 @@ export async function processEmailScheduler(options: {
     });
 
     for (const campaign of campaigns) {
-      // Find the active connected mailbox with credentials for this campaign or fallback
-      let mailbox = null;
-      if (campaign.senderMailboxes && campaign.senderMailboxes.length > 0) {
-        mailbox = await prisma.mailbox.findFirst({
-          where: {
-            OR: [
-              { id: { in: campaign.senderMailboxes } },
-              { email: { in: campaign.senderMailboxes } }
-            ],
-            status: 'CONNECTED',
-            isActive: true
-          },
-          include: { credentials: true }
-        });
-      }
-
-      if (!mailbox) {
-        mailbox = await prisma.mailbox.findFirst({
-          where: { status: 'CONNECTED', isActive: true },
-          include: { credentials: true }
-        });
-      }
-
-      if (!mailbox) {
-        console.log(`[Scheduler] No connected mailbox found for campaign "${campaign.name}" (${campaign.id})`);
+      // 1. Resolve all active, connected mailboxes assigned to this campaign in stable order
+      const assignedMailboxes = await getCampaignAssignedMailboxes(campaign, prisma);
+      if (assignedMailboxes.length === 0) {
+        console.log(`[Scheduler] No connected mailbox found for campaign "${campaign.name}" (${campaign.id}) (NO_MAILBOX_AVAILABLE)`);
         continue;
       }
 
-      const capacity = await getMailboxCapacity(mailbox.id, !!options.force);
-      if (capacity.availableNow <= 0) {
-        console.log(`[Scheduler] Mailbox ${mailbox.email} reached daily/hourly limit.`);
-        continue;
-      }
-
-      // Ensure mailbox isn't rate limited (bypass when force is true)
-      if (!options.force && mailbox.nextAvailableSendAt && mailbox.nextAvailableSendAt > new Date()) {
-        console.log(`[Scheduler] Mailbox ${mailbox.email} in cooldown until ${mailbox.nextAvailableSendAt.toISOString()}`);
-        continue;
-      }
-
-      // Find Due Enrollments (bypass step delay when forced/manual)
-      const enrollmentWhere: any = {
-        campaignId: campaign.id,
-        status: { in: ['pending', 'active'] },
-        AND: [
-          {
-            OR: [
-              { lockedAt: null },
-              { lockExpiresAt: { lte: new Date() } }
-            ]
-          }
-        ]
-      };
-
-      if (!isBypassingDelay) {
-        enrollmentWhere.AND.push({
+      // 2. Protect orphaned in-progress enrollments (e.g. if assigned mailbox was deleted)
+      const orphanedCount = await prisma.enrollment.count({
+        where: {
+          campaignId: campaign.id,
+          mailboxId: null,
           OR: [
-            { nextSendAt: { lte: new Date() } },
-            { nextSendAt: null }
-          ]
-        });
+            { currentStep: { gt: 0 } },
+            { lastSentAt: { not: null } }
+          ],
+          status: { in: ['pending', 'active'] }
+        }
+      });
+      if (orphanedCount > 0) {
+        console.warn(`[Scheduler] Campaign "${campaign.name}" has ${orphanedCount} in-progress enrollments with mailboxId = NULL (ASSIGNED_MAILBOX_DELETED). Holding them to preserve sender identity and email threading.`);
       }
 
-      const dueEnrollments = await prisma.enrollment.findMany({
-        where: enrollmentWhere,
-        take: capacity.availableNow,
-        orderBy: { nextSendAt: 'asc' }
-      });
+      // 3. Resolve eligible mailboxes for this campaign using quotaService
+      const { eligibleMailboxes, skippedReasons } = await resolveEligibleMailboxes(
+        assignedMailboxes,
+        campaign,
+        !!options.force,
+        new Date(),
+        prisma
+      );
+
+      if (eligibleMailboxes.length === 0) {
+        console.log(`[Scheduler] Campaign "${campaign.name}" skipped (No eligible mailboxes: ${JSON.stringify(skippedReasons)})`);
+        continue;
+      }
+
+      // 4. Process sends per eligible mailbox under transaction-level advisory locks
+      for (const mailbox of eligibleMailboxes) {
+        const lockKey = hashStringTo32BitInt(`mb_tx_lock:${mailbox.id}`);
+        let dueEnrollments: any[] = [];
+
+        try {
+          const reservation = await prisma.$transaction(async (tx) => {
+            // A. Transaction-level advisory lock on mailbox
+            const lockResult = await tx.$queryRaw<Array<{ locked: boolean }>>`
+              SELECT pg_try_advisory_xact_lock(${lockKey}) as locked
+            `;
+
+            if (!lockResult[0]?.locked) {
+              return { dueEnrollments: [], skipReason: 'MAILBOX_LOCKED' };
+            }
+
+            // B. Re-evaluate capacity within transaction
+            const capacity = await getEffectiveCapacity(mailbox, campaign, !!options.force);
+            if (capacity.availableCapacity <= 0) {
+              return { dueEnrollments: [], skipReason: capacity.skipReason || 'QUOTA_REACHED' };
+            }
+
+            // C. Ensure mailbox isn't in cooldown
+            if (!options.force && mailbox.nextAvailableSendAt && mailbox.nextAvailableSendAt > new Date()) {
+              return { dueEnrollments: [], skipReason: 'MAILBOX_COOLDOWN' };
+            }
+
+            const toSend: any[] = [];
+
+            // D. Priority 1: Follow-up enrollments strictly assigned to THIS mailbox (Affinity)
+            const followUpWhere: any = {
+              campaignId: campaign.id,
+              mailboxId: mailbox.id,
+              status: { in: ['pending', 'active'] },
+              AND: [
+                {
+                  OR: [
+                    { lockedAt: null },
+                    { lockExpiresAt: { lte: new Date() } }
+                  ]
+                }
+              ]
+            };
+
+            if (!isBypassingDelay) {
+              followUpWhere.AND.push({
+                OR: [
+                  { nextSendAt: { lte: new Date() } },
+                  { nextSendAt: null }
+                ]
+              });
+            }
+
+            const followUps = await tx.enrollment.findMany({
+              where: followUpWhere,
+              take: capacity.availableCapacity,
+              orderBy: { nextSendAt: 'asc' }
+            });
+
+            toSend.push(...followUps);
+
+            // E. Priority 2: If capacity remains, select NEW unassigned leads via fair least-loaded rotation
+            const remainingCapacity = capacity.availableCapacity - toSend.length;
+            if (remainingCapacity > 0) {
+              const newLeadWhere: any = {
+                campaignId: campaign.id,
+                mailboxId: null,
+                currentStep: 0,
+                lastSentAt: null,
+                status: { in: ['pending', 'active'] },
+                AND: [
+                  {
+                    OR: [
+                      { lockedAt: null },
+                      { lockExpiresAt: { lte: new Date() } }
+                    ]
+                  }
+                ]
+              };
+
+              if (!isBypassingDelay) {
+                newLeadWhere.AND.push({
+                  OR: [
+                    { nextSendAt: { lte: new Date() } },
+                    { nextSendAt: null }
+                  ]
+                });
+              }
+
+              // Query persistent database assignment counts
+              const countsMap = await getCampaignEnrollmentCountsByMailbox(
+                campaign.id,
+                assignedMailboxes.map((m: any) => m.id),
+                tx
+              );
+
+              // Pull candidates for rotation evaluation
+              const newCandidates = await tx.enrollment.findMany({
+                where: newLeadWhere,
+                take: remainingCapacity * 4,
+                orderBy: { createdAt: 'asc' }
+              });
+
+              for (const candidate of newCandidates) {
+                if (toSend.length >= capacity.availableCapacity) break;
+
+                const chosen = selectFairMailbox(eligibleMailboxes, countsMap, campaign.senderMailboxes);
+                if (chosen && chosen.id === mailbox.id) {
+                  // Atomically assign mailboxId to this new enrollment in the DB
+                  await tx.enrollment.update({
+                    where: { id: candidate.id },
+                    data: { mailboxId: mailbox.id }
+                  });
+                  // Update local count so subsequent leads in this tick rotate fairly
+                  countsMap.set(mailbox.id, (countsMap.get(mailbox.id) || 0) + 1);
+                  toSend.push(candidate);
+                }
+              }
+            }
+
+            if (toSend.length === 0) {
+              return { dueEnrollments: [] };
+            }
+
+            // F. Lock candidate enrollments for this worker
+            const candidateIds = toSend.map((c) => c.id);
+            await tx.enrollment.updateMany({
+              where: { id: { in: candidateIds } },
+              data: {
+                lockedAt: new Date(),
+                lockedBy: workerId,
+                lockExpiresAt: new Date(Date.now() + 10 * 60 * 1000)
+              }
+            });
+
+            return { dueEnrollments: toSend };
+          });
+
+          if (reservation.skipReason) {
+            console.log(`[Scheduler] Campaign "${campaign.name}" via Mailbox ${mailbox.email} skipped (${reservation.skipReason}).`);
+            continue;
+          }
+
+          dueEnrollments = reservation.dueEnrollments;
+        } catch (txErr) {
+          console.error(`[Scheduler] Reservation transaction error for mailbox ${mailbox.email}:`, txErr);
+          continue;
+        }
 
       for (const enrollment of dueEnrollments) {
         // 1. Lock Enrollment (clearing expired locks if any)
@@ -519,12 +678,22 @@ export async function processEmailScheduler(options: {
             }
           });
 
-          // 11. Update Mailbox counters
+          // 11. Update Mailbox counters & cooldown with dynamic ground truth
+          const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
+          const latestCounts = await getDispatchedMessageCounts({
+            mailboxEmail: mailbox.email,
+            campaignId: campaign.id,
+            startOfHour: bounds.startOfHour,
+            endOfHour: bounds.endOfHour,
+            startOfDay: bounds.startOfDay,
+            endOfDay: bounds.endOfDay
+          });
+
           await prisma.mailbox.update({
             where: { id: mailbox.id },
             data: {
-              emailsSentToday: { increment: 1 },
-              emailsSentThisHour: { increment: 1 },
+              emailsSentToday: latestCounts.mailboxSentToday,
+              emailsSentThisHour: latestCounts.mailboxSentThisHour,
               lastSentAt: new Date(),
               nextAvailableSendAt: new Date(Date.now() + delaySeconds * 1000)
             }
@@ -549,6 +718,7 @@ export async function processEmailScheduler(options: {
         }
       }
     }
+  }
 
     // Update run record
     await prisma.schedulerRun.update({

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import nodemailer from 'nodemailer';
 import { decrypt } from './mailboxController';
+import { getCalendarBucketBounds, getDispatchedMessageCounts } from '../services/quotaService';
 
 const prisma = new PrismaClient();
 
@@ -141,6 +142,20 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
     let smtpError: string | null = null;
 
     if (mailbox && mailbox.credentials && primaryEmail) {
+      const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
+      const bucketCounts = await getDispatchedMessageCounts({
+        mailboxEmail: mailbox.email,
+        startOfHour: bounds.startOfHour,
+        endOfHour: bounds.endOfHour,
+        startOfDay: bounds.startOfDay,
+        endOfDay: bounds.endOfDay
+      });
+
+      if (bucketCounts.mailboxSentToday >= mailbox.dailySendLimit) {
+        res.status(429).json({ error: `Cannot send reply: Mailbox daily safety limit (${mailbox.dailySendLimit}) has been reached for today.` });
+        return;
+      }
+
       try {
         const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
         const smtpPort = mailbox.credentials.encryptedSmtpPort ? Number(decrypt(mailbox.credentials.encryptedSmtpPort)) : 465;
@@ -166,7 +181,11 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
         sentViaSmtp = true;
         await prisma.mailbox.update({
           where: { id: mailbox.id },
-          data: { emailsSentToday: { increment: 1 }, lastSentAt: new Date() }
+          data: {
+            emailsSentToday: bucketCounts.mailboxSentToday + 1,
+            emailsSentThisHour: bucketCounts.mailboxSentThisHour + 1,
+            lastSentAt: new Date()
+          }
         });
       } catch (err: any) {
         console.error('SMTP sending error from Unibox reply:', err);

@@ -17,6 +17,14 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Normalize Vercel multi-service rewrites (/api/backend/...)
+app.use((req, res, next) => {
+  if (req.url.startsWith('/api/backend')) {
+    req.url = req.url.replace('/api/backend', '') || '/';
+  }
+  next();
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });

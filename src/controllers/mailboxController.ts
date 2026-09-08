@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
+import { getCalendarBucketBounds, getDispatchedMessageCounts } from '../services/quotaService';
 
 const prisma = new PrismaClient();
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || process.env.MAILBOX_ENCRYPTION_KEY || '12345678901234567890123456789012'; // 32 bytes
@@ -117,7 +118,19 @@ export const getMailboxes = async (req: Request, res: Response): Promise<void> =
           })
         ]);
 
-        const totalSentAllTime = Math.max(totalMessagesCount, m.emailsSentToday || 0);
+        // Ground-truth calendar-bucket counts in mailbox's sending timezone
+        const bounds = getCalendarBucketBounds(new Date(), m.sendingTimezone || 'Asia/Kolkata');
+        const bucketCounts = await getDispatchedMessageCounts({
+          mailboxEmail: m.email,
+          startOfHour: bounds.startOfHour,
+          endOfHour: bounds.endOfHour,
+          startOfDay: bounds.startOfDay,
+          endOfDay: bounds.endOfDay
+        });
+
+        const emailsSentToday = bucketCounts.mailboxSentToday;
+        const emailsSentThisHour = bucketCounts.mailboxSentThisHour;
+        const totalSentAllTime = Math.max(totalMessagesCount, emailsSentToday, m.emailsSentToday || 0);
         const totalBounced = bouncedMessagesCount;
         // In direct SMTP outreach, emails accepted by recipient SMTP servers are delivered unless bounced:
         const totalDelivered = Math.max(0, totalSentAllTime - totalBounced);
@@ -135,12 +148,12 @@ export const getMailboxes = async (req: Request, res: Response): Promise<void> =
 
         const stats = {
           totalSentAllTime,
-          emailsSentToday: m.emailsSentToday || 0,
-          emailsSentThisHour: m.emailsSentThisHour || 0,
-          remainingToday: Math.max(0, m.dailySendLimit - (m.emailsSentToday || 0)),
-          remainingThisHour: Math.max(0, m.hourlySendLimit - (m.emailsSentThisHour || 0)),
-          dailyUtilization: Math.min(100, Math.round(((m.emailsSentToday || 0) / Math.max(1, m.dailySendLimit)) * 100)),
-          hourlyUtilization: Math.min(100, Math.round(((m.emailsSentThisHour || 0) / Math.max(1, m.hourlySendLimit)) * 100)),
+          emailsSentToday,
+          emailsSentThisHour,
+          remainingToday: Math.max(0, m.dailySendLimit - emailsSentToday),
+          remainingThisHour: Math.max(0, m.hourlySendLimit - emailsSentThisHour),
+          dailyUtilization: Math.min(100, Math.round((emailsSentToday / Math.max(1, m.dailySendLimit)) * 100)),
+          hourlyUtilization: Math.min(100, Math.round((emailsSentThisHour / Math.max(1, m.hourlySendLimit)) * 100)),
           totalDelivered,
           totalBounced,
           totalOpened,
@@ -152,11 +165,15 @@ export const getMailboxes = async (req: Request, res: Response): Promise<void> =
           bounceRate: bounceRate.toFixed(1),
           healthScore,
           campaignsCount: campaigns.length,
-          campaigns
+          campaigns,
+          currentHourResetAt: bounds.endOfHour.toISOString(),
+          timeZone: bounds.timeZone
         };
 
         return {
           ...m,
+          emailsSentToday,
+          emailsSentThisHour,
           stats
         };
       })
@@ -464,6 +481,20 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
+    const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
+    const bucketCounts = await getDispatchedMessageCounts({
+      mailboxEmail: mailbox.email,
+      startOfHour: bounds.startOfHour,
+      endOfHour: bounds.endOfHour,
+      startOfDay: bounds.startOfDay,
+      endOfDay: bounds.endOfDay
+    });
+
+    if (bucketCounts.mailboxSentToday >= mailbox.dailySendLimit) {
+      res.status(429).json({ error: `Cannot send test email: Mailbox daily sending limit (${mailbox.dailySendLimit}) has been reached for today.` });
+      return;
+    }
+
     const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
     const smtpPort = mailbox.credentials.encryptedSmtpPort ? Number(decrypt(mailbox.credentials.encryptedSmtpPort)) : 465;
     const smtpUser = mailbox.credentials.encryptedSmtpUsername ? decrypt(mailbox.credentials.encryptedSmtpUsername) : mailbox.email;
@@ -506,11 +537,12 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
       `
     });
 
-    // Increment emailsSentToday
+    // Synchronize mailbox sent counters with dynamic ground truth
     await prisma.mailbox.update({
       where: { id },
       data: {
-        emailsSentToday: { increment: 1 },
+        emailsSentToday: bucketCounts.mailboxSentToday + 1,
+        emailsSentThisHour: bucketCounts.mailboxSentThisHour + 1,
         lastSentAt: new Date()
       }
     });
