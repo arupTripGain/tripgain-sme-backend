@@ -500,44 +500,54 @@ export async function processEmailScheduler(options: {
             });
 
             // Tracking base URL
-            const trackingBaseUrl = process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || 'http://localhost:3001';
+            const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
+            let trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
+            if (!trackingBaseUrl && !isProduction) {
+              trackingBaseUrl = 'http://localhost:3001';
+            }
+
+            if (!trackingBaseUrl && isProduction) {
+              console.warn('[Scheduler] TRACKING_BASE_URL is not configured in production. Tracking pixel and link rewrites are omitted to fail safely without generating localhost URLs.');
+            }
 
             // Open tracking pixel
-            const openTrackingPixel = campaign.openTracking !== false
+            const openTrackingPixel = (campaign.openTracking !== false && trackingBaseUrl)
               ? `<img src="${trackingBaseUrl}/t/${trackingToken}" width="1" height="1" style="display:none;width:1px;height:1px;border:0;outline:none;" alt="" />`
               : '';
 
             // Link click tracking: rewrite external links in renderedBody and store in EmailLink database
             let finalBodyHtml = renderedBody;
-            try {
-              const linkMatches: { originalMatch: string; originalUrl: string; restOfTag: string; linkToken: string }[] = [];
-              const linkRegex = /<a\s+(?:[^>]*?\s+)?href=(["'])(https?:\/\/[^"']+)\1([^>]*)>/gi;
-              let match: RegExpExecArray | null;
-              while ((match = linkRegex.exec(renderedBody)) !== null) {
-                const originalMatch = match[0];
-                const originalUrl = match[2];
-                const restOfTag = match[3] || '';
-                if (originalUrl && !originalUrl.includes('/r/') && !originalUrl.includes('/t/')) {
-                  const linkToken = crypto.randomUUID();
-                  linkMatches.push({ originalMatch, originalUrl, restOfTag, linkToken });
-                }
-              }
-
-              for (const item of linkMatches) {
-                await prisma.emailLink.create({
-                  data: {
-                    emailMessageId: message.id,
-                    trackingToken: item.linkToken,
-                    destinationUrl: item.originalUrl,
-                    linkType: 'BODY_LINK'
+            if (trackingBaseUrl) {
+              try {
+                const linkMatches: { originalMatch: string; originalUrl: string; restOfTag: string; linkToken: string }[] = [];
+                const linkRegex = /<a\s+(?:[^>]*?\s+)?href=(["'])(https?:\/\/[^"']+)\1([^>]*)>/gi;
+                let match: RegExpExecArray | null;
+                while ((match = linkRegex.exec(renderedBody)) !== null) {
+                  const originalMatch = match[0];
+                  const originalUrl = match[2];
+                  const restOfTag = match[3] || '';
+                  if (originalUrl && !originalUrl.includes('/r/') && !originalUrl.includes('/t/')) {
+                    const linkToken = crypto.randomUUID();
+                    linkMatches.push({ originalMatch, originalUrl, restOfTag, linkToken });
                   }
-                });
-                const redirectUrl = `${trackingBaseUrl}/r/${item.linkToken}`;
-                finalBodyHtml = finalBodyHtml.replace(item.originalMatch, `<a href="${redirectUrl}"${item.restOfTag}>`);
+                }
+
+                for (const item of linkMatches) {
+                  await prisma.emailLink.create({
+                    data: {
+                      emailMessageId: message.id,
+                      trackingToken: item.linkToken,
+                      destinationUrl: item.originalUrl,
+                      linkType: 'BODY_LINK'
+                    }
+                  });
+                  const redirectUrl = `${trackingBaseUrl}/r/${item.linkToken}`;
+                  finalBodyHtml = finalBodyHtml.replace(item.originalMatch, `<a href="${redirectUrl}"${item.restOfTag}>`);
+                }
+              } catch (rewriteErr) {
+                console.error('[Scheduler] Error rewriting links for click tracking:', rewriteErr);
+                finalBodyHtml = renderedBody;
               }
-            } catch (rewriteErr) {
-              console.error('[Scheduler] Error rewriting links for click tracking:', rewriteErr);
-              finalBodyHtml = renderedBody;
             }
 
             // Clean email HTML with proper margins for Gmail/Outlook

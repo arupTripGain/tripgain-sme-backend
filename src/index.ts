@@ -112,6 +112,7 @@ import aiRoutes from './routes/aiRoutes';
 app.use('/api/ai', aiRoutes);
 
 // Phase 6 Engine & Tracking
+app.get('/api/scheduler/tick', runTick);
 app.post('/api/scheduler/tick', runTick);
 app.post('/api/webhooks/simulate-event', simulateEvent);
 app.post('/api/webhooks/email-provider', handleProviderWebhook); // Phase 9
@@ -143,12 +144,18 @@ app.get('/api/integrations/microsoft/callback', microsoftCallback);
 app.listen(port, () => {
   console.log(`Backend server is running on port ${port}`);
 
-  // Automated background scheduler runner every 60s
-  setInterval(() => {
-    processEmailScheduler().catch(err => {
-      console.error('[Background Scheduler Interval Error]:', err);
-    });
-  }, 60000);
+  // Automated background scheduler runner for local development only
+  // In production / Vercel, scheduler execution is driven by an external cron caller
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    console.log('[Scheduler] Initializing local 60s interval runner...');
+    setInterval(() => {
+      processEmailScheduler().catch(err => {
+        console.error('[Background Scheduler Interval Error]:', err);
+      });
+    }, 60000);
+  } else {
+    console.log('[Scheduler] In-process interval runner disabled in production/Vercel (managed via external cron).');
+  }
 });
 
 process.on('SIGINT', async () => {
