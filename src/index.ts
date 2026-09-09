@@ -52,7 +52,7 @@ import { getMailboxes, connectSmtpImap, disconnectMailbox, testMailbox, sendTest
 import { login, register, getMe, getUsers, deleteUser } from './controllers/authController';
 import { authenticateToken, optionalAuth } from './middleware/authMiddleware';
 
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Global user identity & auth middleware
 app.use('/api', optionalAuth);
