@@ -25,6 +25,15 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'TripGain SME Outreach Backend API',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
@@ -141,22 +150,22 @@ app.post('/api/mailboxes/:id/send-test', sendTestEmail);
 app.get('/api/integrations/google/callback', googleCallback);
 app.get('/api/integrations/microsoft/callback', microsoftCallback);
 
-app.listen(port, () => {
-  console.log(`Backend server is running on port ${port}`);
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Backend server is running on port ${port}`);
 
-  // Automated background scheduler runner for local development only
-  // In production / Vercel, scheduler execution is driven by an external cron caller
-  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-    console.log('[Scheduler] Initializing local 60s interval runner...');
-    setInterval(() => {
-      processEmailScheduler().catch(err => {
-        console.error('[Background Scheduler Interval Error]:', err);
-      });
-    }, 60000);
-  } else {
-    console.log('[Scheduler] In-process interval runner disabled in production/Vercel (managed via external cron).');
-  }
-});
+    // Automated background scheduler runner for local development only
+    // In production / Vercel, scheduler execution is driven by an external cron caller
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[Scheduler] Initializing local 60s interval runner...');
+      setInterval(() => {
+        processEmailScheduler().catch(err => {
+          console.error('[Background Scheduler Interval Error]:', err);
+        });
+      }, 60000);
+    }
+  });
+}
 
 process.on('SIGINT', async () => {
   await prisma.$disconnect();

@@ -2,7 +2,14 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "src/index.ts",
+  "allowScripts": {
+    "@google/genai": true,
+    "@prisma/client": true,
+    "@prisma/engines": true,
+    "prisma": true,
+    "protobufjs": true
+  },
   "scripts": {
     "build": "prisma generate && tsc",
     "start": "node dist/src/index.js",
