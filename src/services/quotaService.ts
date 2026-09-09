@@ -125,57 +125,116 @@ export function isWithinSendingWindow(
  * Only successfully dispatched outbound messages count.
  * Engagement statuses (delivered, opened, clicked) do NOT double-count.
  */
-export async function getDispatchedMessageCounts(params: {
-  mailboxEmail: string;
-  campaignId?: string | null;
-  startOfHour: Date;
-  endOfHour: Date;
-  startOfDay: Date;
-  endOfDay: Date;
-}): Promise<{
+export async function getDispatchedMessageCounts(
+  params: {
+    mailboxEmail: string;
+    campaignId?: string | null;
+    startOfHour: Date;
+    endOfHour: Date;
+    startOfDay: Date;
+    endOfDay: Date;
+  },
+  client: any = prisma
+): Promise<{
   mailboxSentThisHour: number;
   mailboxSentToday: number;
   campaignSentThisHour: number;
   campaignSentToday: number;
 }> {
-  const validStatuses = ['sent', 'delivered', 'opened', 'clicked', 'bounced'];
+  const email = params.mailboxEmail.toLowerCase().trim();
+  const campaignId = params.campaignId || null;
 
-  // 1. Mailbox sends: All EmailMessage sent from this mailbox + any standalone manual ConversationMessage (e.g. test emails or Unibox replies)
+  try {
+    const rows = await client.$queryRaw<Array<{
+      mailboxSentThisHour: number;
+      mailboxSentToday: number;
+      campaignSentThisHour: number;
+      campaignSentToday: number;
+    }>>`
+      WITH mb_emails AS (
+        SELECT 
+          COUNT(*) FILTER (WHERE "sentAt" >= ${params.startOfHour} AND "sentAt" < ${params.endOfHour})::int as hour_count,
+          COUNT(*)::int as day_count
+        FROM "EmailMessage"
+        WHERE "fromEmail" = ${email}
+          AND "status" = ANY(ARRAY['sent', 'delivered', 'opened', 'clicked', 'bounced'])
+          AND "sentAt" >= ${params.startOfDay}
+          AND "sentAt" < ${params.endOfDay}
+      ),
+      mb_convs AS (
+        SELECT
+          COUNT(*) FILTER (WHERE "sentAt" >= ${params.startOfHour} AND "sentAt" < ${params.endOfHour})::int as hour_count,
+          COUNT(*)::int as day_count
+        FROM "ConversationMessage"
+        WHERE "senderEmail" = ${email}
+          AND "direction" = 'OUTBOUND'
+          AND "emailMessageId" IS NULL
+          AND "sentAt" >= ${params.startOfDay}
+          AND "sentAt" < ${params.endOfDay}
+      ),
+      camp_emails AS (
+        SELECT
+          COUNT(*) FILTER (WHERE "sentAt" >= ${params.startOfHour} AND "sentAt" < ${params.endOfHour})::int as hour_count,
+          COUNT(*)::int as day_count
+        FROM "EmailMessage"
+        WHERE ${campaignId}::text IS NOT NULL
+          AND "campaignId" = ${campaignId}
+          AND "status" = ANY(ARRAY['sent', 'delivered', 'opened', 'clicked', 'bounced'])
+          AND "sentAt" >= ${params.startOfDay}
+          AND "sentAt" < ${params.endOfDay}
+      )
+      SELECT
+        (COALESCE((SELECT hour_count FROM mb_emails), 0) + COALESCE((SELECT hour_count FROM mb_convs), 0))::int as "mailboxSentThisHour",
+        (COALESCE((SELECT day_count FROM mb_emails), 0) + COALESCE((SELECT day_count FROM mb_convs), 0))::int as "mailboxSentToday",
+        COALESCE((SELECT hour_count FROM camp_emails), 0)::int as "campaignSentThisHour",
+        COALESCE((SELECT day_count FROM camp_emails), 0)::int as "campaignSentToday"
+    `;
+
+    if (rows && rows.length > 0) {
+      return {
+        mailboxSentThisHour: Number(rows[0]?.mailboxSentThisHour ?? 0),
+        mailboxSentToday: Number(rows[0]?.mailboxSentToday ?? 0),
+        campaignSentThisHour: Number(rows[0]?.campaignSentThisHour ?? 0),
+        campaignSentToday: Number(rows[0]?.campaignSentToday ?? 0)
+      };
+    }
+  } catch (err) {
+    console.warn('[QuotaService] Raw query error in getDispatchedMessageCounts, falling back to safe exact-match count queries:', err);
+  }
+
+  // Safe fallback using exact string match (no case-insensitive full scan)
+  const validStatuses = ['sent', 'delivered', 'opened', 'clicked', 'bounced'];
   const [
     mailboxCampaignHour,
     mailboxCampaignDay,
     mailboxDirectHour,
     mailboxDirectDay
   ] = await Promise.all([
-    // EmailMessage in current hour
-    prisma.emailMessage.count({
+    client.emailMessage.count({
       where: {
-        fromEmail: { equals: params.mailboxEmail, mode: 'insensitive' },
+        fromEmail: email,
         status: { in: validStatuses },
         sentAt: { gte: params.startOfHour, lt: params.endOfHour }
       }
     }),
-    // EmailMessage in current day
-    prisma.emailMessage.count({
+    client.emailMessage.count({
       where: {
-        fromEmail: { equals: params.mailboxEmail, mode: 'insensitive' },
+        fromEmail: email,
         status: { in: validStatuses },
         sentAt: { gte: params.startOfDay, lt: params.endOfDay }
       }
     }),
-    // ConversationMessage without emailMessageId (manual replies or test emails) in current hour
-    prisma.conversationMessage.count({
+    client.conversationMessage.count({
       where: {
-        senderEmail: { equals: params.mailboxEmail, mode: 'insensitive' },
+        senderEmail: email,
         direction: 'OUTBOUND',
         emailMessageId: null,
         sentAt: { gte: params.startOfHour, lt: params.endOfHour }
       }
     }),
-    // ConversationMessage without emailMessageId in current day
-    prisma.conversationMessage.count({
+    client.conversationMessage.count({
       where: {
-        senderEmail: { equals: params.mailboxEmail, mode: 'insensitive' },
+        senderEmail: email,
         direction: 'OUTBOUND',
         emailMessageId: null,
         sentAt: { gte: params.startOfDay, lt: params.endOfDay }
@@ -183,25 +242,20 @@ export async function getDispatchedMessageCounts(params: {
     })
   ]);
 
-  const mailboxSentThisHour = mailboxCampaignHour + mailboxDirectHour;
-  const mailboxSentToday = mailboxCampaignDay + mailboxDirectDay;
-
-  // 2. Campaign sends (if campaignId is provided)
   let campaignSentThisHour = 0;
   let campaignSentToday = 0;
-
-  if (params.campaignId) {
+  if (campaignId) {
     const [campHour, campDay] = await Promise.all([
-      prisma.emailMessage.count({
+      client.emailMessage.count({
         where: {
-          campaignId: params.campaignId,
+          campaignId,
           status: { in: validStatuses },
           sentAt: { gte: params.startOfHour, lt: params.endOfHour }
         }
       }),
-      prisma.emailMessage.count({
+      client.emailMessage.count({
         where: {
-          campaignId: params.campaignId,
+          campaignId,
           status: { in: validStatuses },
           sentAt: { gte: params.startOfDay, lt: params.endOfDay }
         }
@@ -212,8 +266,8 @@ export async function getDispatchedMessageCounts(params: {
   }
 
   return {
-    mailboxSentThisHour,
-    mailboxSentToday,
+    mailboxSentThisHour: mailboxCampaignHour + mailboxDirectHour,
+    mailboxSentToday: mailboxCampaignDay + mailboxDirectDay,
     campaignSentThisHour,
     campaignSentToday
   };

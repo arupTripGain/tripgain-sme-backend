@@ -117,7 +117,7 @@ export async function resolveEligibleMailboxes(
       endOfHour: bounds.endOfHour,
       startOfDay: bounds.startOfDay,
       endOfDay: bounds.endOfDay
-    });
+    }, client);
 
     const capacity = calculateEffectiveCapacity({
       mailboxHourlyLimit: mailbox.hourlySendLimit,

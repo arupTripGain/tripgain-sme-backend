@@ -58,7 +58,13 @@ async function shouldStopBeforeSend(enrollmentId: string): Promise<{ stop: boole
 // ---------------------------------------------------------------------
 // Two-Tier Hierarchical Capacity & Window Check
 // ---------------------------------------------------------------------
-async function getEffectiveCapacity(mailbox: any, campaign: any, force = false) {
+async function getEffectiveCapacity(
+  mailbox: any,
+  campaign: any,
+  force = false,
+  precomputedCapacity?: number,
+  client: any = prisma
+) {
   if (force) {
     return {
       availableCapacity: 50,
@@ -83,10 +89,22 @@ async function getEffectiveCapacity(mailbox: any, campaign: any, force = false) 
     };
   }
 
+  // If capacity was already precomputed in the same tick under window & quota evaluation, reuse it directly
+  if (precomputedCapacity !== undefined) {
+    return {
+      availableCapacity: Math.max(0, precomputedCapacity),
+      skipReason: precomputedCapacity <= 0 ? 'QUOTA_REACHED' : null,
+      mailboxRemainingHourly: precomputedCapacity,
+      mailboxRemainingDaily: precomputedCapacity,
+      campaignRemainingHourly: precomputedCapacity,
+      campaignRemainingDaily: precomputedCapacity
+    };
+  }
+
   // 2. Derive exact calendar-hour and calendar-day bounds based on mailbox.sendingTimezone
   const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
 
-  // 3. Ground-truth query of successfully dispatched outbound messages
+  // 3. Ground-truth query of successfully dispatched outbound messages (single round-trip)
   const counts = await getDispatchedMessageCounts({
     mailboxEmail: mailbox.email,
     campaignId: campaign.id,
@@ -94,7 +112,7 @@ async function getEffectiveCapacity(mailbox: any, campaign: any, force = false) 
     endOfHour: bounds.endOfHour,
     startOfDay: bounds.startOfDay,
     endOfDay: bounds.endOfDay
-  });
+  }, client);
 
   // 4. Calculate effective capacity respecting both mailbox and campaign ceilings
   return calculateEffectiveCapacity({
@@ -123,6 +141,8 @@ export async function processEmailScheduler(options: {
   let emailsFailed = 0;
 
   const isBypassingDelay = Boolean(options.force || options.bypassStepDelay);
+  const now = new Date();
+  const tickStart = performance.now();
   console.log(`[Scheduler] Starting run. Worker ID: ${workerId}, Force: ${!!options.force}, BypassDelay: ${isBypassingDelay}${options.campaignId ? `, Campaign: ${options.campaignId}` : ''}`);
   
   const run = await prisma.schedulerRun.create({
@@ -130,18 +150,53 @@ export async function processEmailScheduler(options: {
   });
 
   try {
-    const campaignWhere: any = { status: 'active' };
-    if (options.campaignId) {
-      campaignWhere.id = options.campaignId;
+    const enrollmentDueCondition: any = {
+      status: { in: ['pending', 'active'] },
+      AND: [
+        {
+          OR: [
+            { lockedAt: null },
+            { lockExpiresAt: { lte: now } }
+          ]
+        }
+      ]
+    };
+
+    if (!isBypassingDelay) {
+      enrollmentDueCondition.AND.push({
+        OR: [
+          { nextSendAt: { lte: now } },
+          { nextSendAt: null }
+        ]
+      });
     }
 
+    const campaignWhere: any = {
+      status: 'active',
+      enrollments: {
+        some: enrollmentDueCondition
+      }
+    };
+
+    if (options.campaignId) {
+      campaignWhere.id = options.campaignId;
+      if (!options.force) {
+        campaignWhere.approvalStatus = 'APPROVED';
+      }
+    } else {
+      campaignWhere.approvalStatus = 'APPROVED';
+    }
+
+    const tCampSelect = performance.now();
     const campaigns = await prisma.campaign.findMany({
       where: campaignWhere
     });
-
-    console.log(`[Scheduler] Campaigns checked: ${campaigns.length}`);
+    const campSelectDuration = Math.round(performance.now() - tCampSelect);
+    console.log(`[Scheduler] Campaign selection: ${campSelectDuration}ms (${campaigns.length} campaigns with due leads)`);
 
     for (const campaign of campaigns) {
+      const campStart = performance.now();
+
       // 0. Campaign approval check
       if (campaign.approvalStatus && campaign.approvalStatus !== 'APPROVED') {
         console.log(`[Scheduler] Skip reason: campaign "${campaign.name}" not approved (approvalStatus: ${campaign.approvalStatus})`);
@@ -149,6 +204,7 @@ export async function processEmailScheduler(options: {
       }
 
       // 1. Resolve all active, connected mailboxes assigned to this campaign in stable order
+      const tMbResolve = performance.now();
       const assignedMailboxes = await getCampaignAssignedMailboxes(campaign, prisma);
       if (assignedMailboxes.length === 0) {
         console.log(`[Scheduler] Skip reason: no eligible mailbox for campaign "${campaign.name}" (${campaign.id}) (NO_MAILBOX_AVAILABLE)`);
@@ -169,13 +225,16 @@ export async function processEmailScheduler(options: {
       }
 
       // 3. Resolve eligible mailboxes for this campaign using quotaService
-      const { eligibleMailboxes, skippedReasons } = await resolveEligibleMailboxes(
+      const { eligibleMailboxes, mailboxCapacityMap, skippedReasons } = await resolveEligibleMailboxes(
         assignedMailboxes,
         campaign,
         !!options.force,
-        new Date(),
+        now,
         prisma
       );
+
+      const mbResolveDuration = Math.round(performance.now() - tMbResolve);
+      console.log(`[Scheduler] Campaign "${campaign.name}": resolved ${eligibleMailboxes.length}/${assignedMailboxes.length} eligible mailboxes in ${mbResolveDuration}ms`);
 
       if (eligibleMailboxes.length === 0) {
         console.log(`[Scheduler] Skip reason: no eligible mailboxes for campaign "${campaign.name}" (${JSON.stringify(skippedReasons)})`);
@@ -186,8 +245,10 @@ export async function processEmailScheduler(options: {
       for (const mailbox of eligibleMailboxes) {
         const lockKey = hashStringTo32BitInt(`mb_tx_lock:${mailbox.id}`);
         let dueEnrollments: any[] = [];
+        const precomputedCap = mailboxCapacityMap.get(mailbox.id);
 
         try {
+          const tTx = performance.now();
           const reservation = await prisma.$transaction(async (tx) => {
             // A. Transaction-level advisory lock on mailbox
             const lockResult = await tx.$queryRaw<Array<{ locked: boolean }>>`
@@ -198,14 +259,14 @@ export async function processEmailScheduler(options: {
               return { dueEnrollments: [], skipReason: 'MAILBOX_LOCKED' };
             }
 
-            // B. Re-evaluate capacity within transaction
-            const capacity = await getEffectiveCapacity(mailbox, campaign, !!options.force);
+            // B. Re-evaluate capacity within transaction using precomputed capacity (avoids 6 duplicate queries)
+            const capacity = await getEffectiveCapacity(mailbox, campaign, !!options.force, precomputedCap, tx);
             if (capacity.availableCapacity <= 0) {
               return { dueEnrollments: [], skipReason: capacity.skipReason || 'QUOTA_REACHED' };
             }
 
             // C. Ensure mailbox isn't in cooldown
-            if (!options.force && mailbox.nextAvailableSendAt && mailbox.nextAvailableSendAt > new Date()) {
+            if (!options.force && mailbox.nextAvailableSendAt && mailbox.nextAvailableSendAt > now) {
               return { dueEnrollments: [], skipReason: 'MAILBOX_COOLDOWN' };
             }
 
@@ -685,6 +746,7 @@ export async function processEmailScheduler(options: {
           await prisma.enrollment.update({
             where: { id: enrollment.id },
             data: {
+              mailboxId: enrollment.mailboxId || mailbox.id,
               currentStep: nextStep ? nextStep.stepNumber : step.stepNumber,
               status: nextStep ? 'active' : 'completed',
               lastSentAt: new Date(),
@@ -701,7 +763,7 @@ export async function processEmailScheduler(options: {
             endOfHour: bounds.endOfHour,
             startOfDay: bounds.startOfDay,
             endOfDay: bounds.endOfDay
-          });
+          }, prisma);
 
           await prisma.mailbox.update({
             where: { id: mailbox.id },
@@ -744,7 +806,8 @@ export async function processEmailScheduler(options: {
         emailsFailed,
       }
     });
-    console.log(`[Scheduler] Tick completed. Campaigns checked: ${campaigns.length}, Emails sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
+    const totalTickDuration = Math.round(performance.now() - tickStart);
+    console.log(`[Scheduler] Tick completed in ${totalTickDuration}ms. Campaigns checked: ${campaigns.length}, Emails sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
     return { emailsSent, emailsSkipped, emailsFailed };
   } catch (err) {
     console.error(`[Scheduler] Critical Error:`, err);
