@@ -139,23 +139,28 @@ export async function processEmailScheduler(options: {
       where: campaignWhere
     });
 
+    console.log(`[Scheduler] Campaigns checked: ${campaigns.length}`);
+
     for (const campaign of campaigns) {
-      // 1. Resolve all active, connected mailboxes assigned to this campaign in stable order
-      const assignedMailboxes = await getCampaignAssignedMailboxes(campaign, prisma);
-      if (assignedMailboxes.length === 0) {
-        console.log(`[Scheduler] No connected mailbox found for campaign "${campaign.name}" (${campaign.id}) (NO_MAILBOX_AVAILABLE)`);
+      // 0. Campaign approval check
+      if (campaign.approvalStatus && campaign.approvalStatus !== 'APPROVED') {
+        console.log(`[Scheduler] Skip reason: campaign "${campaign.name}" not approved (approvalStatus: ${campaign.approvalStatus})`);
         continue;
       }
 
-      // 2. Protect orphaned in-progress enrollments (e.g. if assigned mailbox was deleted)
+      // 1. Resolve all active, connected mailboxes assigned to this campaign in stable order
+      const assignedMailboxes = await getCampaignAssignedMailboxes(campaign, prisma);
+      if (assignedMailboxes.length === 0) {
+        console.log(`[Scheduler] Skip reason: no eligible mailbox for campaign "${campaign.name}" (${campaign.id}) (NO_MAILBOX_AVAILABLE)`);
+        continue;
+      }
+
+      // 2. Protect orphaned in-progress enrollments (e.g. if assigned mailbox was deleted after sending started)
       const orphanedCount = await prisma.enrollment.count({
         where: {
           campaignId: campaign.id,
           mailboxId: null,
-          OR: [
-            { currentStep: { gt: 0 } },
-            { lastSentAt: { not: null } }
-          ],
+          lastSentAt: { not: null },
           status: { in: ['pending', 'active'] }
         }
       });
@@ -173,7 +178,7 @@ export async function processEmailScheduler(options: {
       );
 
       if (eligibleMailboxes.length === 0) {
-        console.log(`[Scheduler] Campaign "${campaign.name}" skipped (No eligible mailboxes: ${JSON.stringify(skippedReasons)})`);
+        console.log(`[Scheduler] Skip reason: no eligible mailboxes for campaign "${campaign.name}" (${JSON.stringify(skippedReasons)})`);
         continue;
       }
 
@@ -244,7 +249,6 @@ export async function processEmailScheduler(options: {
               const newLeadWhere: any = {
                 campaignId: campaign.id,
                 mailboxId: null,
-                currentStep: 0,
                 lastSentAt: null,
                 status: { in: ['pending', 'active'] },
                 AND: [
@@ -316,7 +320,7 @@ export async function processEmailScheduler(options: {
           });
 
           if (reservation.skipReason) {
-            console.log(`[Scheduler] Campaign "${campaign.name}" via Mailbox ${mailbox.email} skipped (${reservation.skipReason}).`);
+            console.log(`[Scheduler] Skip reason: ${reservation.skipReason} for campaign "${campaign.name}" via mailbox ${mailbox.email}.`);
             continue;
           }
 
@@ -740,7 +744,7 @@ export async function processEmailScheduler(options: {
         emailsFailed,
       }
     });
-    console.log(`[Scheduler] Finished run. Sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
+    console.log(`[Scheduler] Tick completed. Campaigns checked: ${campaigns.length}, Emails sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
     return { emailsSent, emailsSkipped, emailsFailed };
   } catch (err) {
     console.error(`[Scheduler] Critical Error:`, err);
