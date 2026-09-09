@@ -1,11 +1,17 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
-// Setup dummy workspace if not exists
-async function getWorkspace() {
-  let workspace = await prisma.workspace.findFirst();
+// Setup workspace for user if not exists
+async function getWorkspace(userId?: string) {
+  let workspace = userId
+    ? await prisma.workspace.findFirst({ where: { userId } })
+    : await prisma.workspace.findFirst();
+  if (!workspace) {
+    workspace = await prisma.workspace.findFirst();
+  }
   if (!workspace) {
     const user = await prisma.user.create({
       data: { email: 'admin@tripgain.com', name: 'Admin' }
@@ -19,13 +25,17 @@ async function getWorkspace() {
 
 export const getLists = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { search } = req.query;
     
-    let whereClause: any = {};
+    let whereClause: any = {
+      userId: user.userId
+    };
+
     if (search && typeof search === 'string') {
-      whereClause = {
-        name: { contains: search, mode: 'insensitive' }
-      };
+      whereClause.name = { contains: search, mode: 'insensitive' };
     }
 
     const lists = await prisma.list.findMany({
@@ -43,14 +53,18 @@ export const getLists = async (req: Request, res: Response): Promise<void> => {
       name: list.name,
       contacts: list._count.members,
       type: list.listType,
-      status: 'Active' // We can expand this later
+      status: 'Active'
     }));
     
-    // Add a default Suppression List to match the spec mockup
+    // Add a default Suppression List for current user
+    const suppressionCount = await prisma.suppressionList.count({
+      where: { userId: user.userId }
+    });
+
     formatted.push({
       id: 'suppression-1',
       name: 'Suppression List',
-      contacts: 0,
+      contacts: suppressionCount,
       type: 'system',
       status: 'Active'
     });
@@ -64,8 +78,11 @@ export const getLists = async (req: Request, res: Response): Promise<void> => {
 
 export const createList = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { name, listType, description, rules } = req.body;
-    const workspace = await getWorkspace();
+    const workspace = await getWorkspace(user.userId);
     
     const list = await prisma.list.create({
       data: {
@@ -73,7 +90,8 @@ export const createList = async (req: Request, res: Response): Promise<void> => 
         listType: listType || 'static',
         description,
         rules: rules ? rules : undefined,
-        workspaceId: workspace.id
+        workspaceId: workspace.id,
+        userId: user.userId
       }
     });
     
@@ -86,33 +104,41 @@ export const createList = async (req: Request, res: Response): Promise<void> => 
 
 export const getListById = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     
     if (id === 'suppression-1') {
+      const suppressions = await prisma.suppressionList.findMany({
+        where: { userId: user.userId },
+        orderBy: { suppressedAt: 'desc' }
+      });
       res.status(200).json({
         id: 'suppression-1',
         name: 'Suppression List',
         listType: 'system',
-        contacts: []
+        contacts: suppressions.map(s => ({
+          id: s.id,
+          email: s.email,
+          fullName: s.email,
+          status: 'Suppressed',
+          reason: s.reason,
+          createdAt: s.suppressedAt
+        }))
       });
       return;
     }
     
-    const list = await prisma.list.findUnique({
-      where: { id: String(id) }
-    });
-    
-    if (!list) {
-      res.status(404).json({ error: 'List not found' });
-      return;
-    }
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
     
     let resolvedContacts: any[] = [];
     
     if (list.listType === 'dynamic' && list.rules) {
-      // Execute dynamic rules
+      // Execute dynamic rules scoped strictly to user's contacts
       const rules = list.rules as any;
-      let whereClause: any = { workspaceId: list.workspaceId };
+      let whereClause: any = { userId: user.userId };
       
       if (rules.city) whereClause.city = { contains: rules.city, mode: 'insensitive' };
       if (rules.jobTitle) whereClause.jobTitle = { contains: rules.jobTitle, mode: 'insensitive' };
@@ -149,7 +175,7 @@ export const getListById = async (req: Request, res: Response): Promise<void> =>
         orderBy: { addedAt: 'desc' }
       });
       
-      resolvedContacts = members.map(m => m.contact);
+      resolvedContacts = members.map(m => m.contact).filter(Boolean);
     }
     
     const formattedContacts = resolvedContacts.map(c => ({
@@ -190,19 +216,21 @@ export const deleteList = async (req: Request, res: Response): Promise<void> => 
       res.status(403).json({ error: 'Cannot delete system lists' });
       return;
     }
+
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
     
     // Explicitly delete related records since onDelete: Cascade is missing for List relations
-    // First, remove listId from campaigns to prevent constraint violation
     await prisma.$transaction([
       prisma.campaign.updateMany({
-        where: { listId: String(id) },
+        where: { listId: list.id },
         data: { listId: null }
       }),
       prisma.listMember.deleteMany({
-        where: { listId: String(id) }
+        where: { listId: list.id }
       }),
       prisma.list.delete({
-        where: { id: String(id) }
+        where: { id: list.id }
       })
     ]);
     
@@ -215,6 +243,9 @@ export const deleteList = async (req: Request, res: Response): Promise<void> => 
 
 export const addMembersToList = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     const { contactIds } = req.body;
     
@@ -223,11 +254,8 @@ export const addMembersToList = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const list = await prisma.list.findUnique({ where: { id: String(id) } });
-    if (!list) {
-      res.status(404).json({ error: 'List not found' });
-      return;
-    }
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
 
     // Only static lists can have members manually added
     if (list.listType !== 'static') {
@@ -235,18 +263,31 @@ export const addMembersToList = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // Insert only if they don't already exist (using Prisma's createMany with skipDuplicates if supported, or individual creates)
-    // Prisma createMany skipDuplicates is supported on Postgres
+    // Verify contactIds belong to current user
+    const userContacts = await prisma.contact.findMany({
+      where: {
+        id: { in: contactIds },
+        userId: user.userId
+      },
+      select: { id: true }
+    });
+
+    const validContactIds = userContacts.map(c => c.id);
+    if (validContactIds.length === 0) {
+      res.status(400).json({ error: 'No valid contacts owned by current user found' });
+      return;
+    }
+
     await prisma.listMember.createMany({
-      data: contactIds.map(contactId => ({
-        listId: String(id),
+      data: validContactIds.map(contactId => ({
+        listId: list.id,
         contactId: contactId,
         membershipStatus: 'active'
       })),
       skipDuplicates: true
     });
     
-    res.status(200).json({ success: true });
+    res.status(200).json({ success: true, addedCount: validContactIds.length });
   } catch (error) {
     console.error('Error adding members to list:', error);
     res.status(500).json({ error: 'Failed to add members' });
@@ -263,9 +304,12 @@ export const removeMembersFromList = async (req: Request, res: Response): Promis
       return;
     }
 
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
+
     await prisma.listMember.deleteMany({
       where: {
-        listId: String(id),
+        listId: list.id,
         contactId: { in: contactIds }
       }
     });
@@ -281,8 +325,11 @@ export const updateList = async (req: Request, res: Response): Promise<void> => 
     const { id } = req.params;
     const { name, description } = req.body;
     
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
+
     const updated = await prisma.list.update({
-      where: { id: String(id) },
+      where: { id: list.id },
       data: {
         ...(name && { name }),
         ...(description !== undefined && { description })
@@ -298,26 +345,33 @@ export const updateList = async (req: Request, res: Response): Promise<void> => 
 
 export const duplicateList = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     
-    const list = await prisma.list.findUnique({
-      where: { id: String(id) },
+    const list = await OwnershipGuard.assertList(req, res, String(id));
+    if (!list) return;
+
+    const fullList = await prisma.list.findUnique({
+      where: { id: list.id },
       include: { members: true }
     });
     
-    if (!list) {
+    if (!fullList) {
       res.status(404).json({ error: 'List not found' });
       return;
     }
     
     const duplicatedList = await prisma.list.create({
       data: {
-        name: `${list.name} (Copy)`,
-        listType: list.listType,
-        description: list.description,
-        workspaceId: list.workspaceId,
+        name: `${fullList.name} (Copy)`,
+        listType: fullList.listType,
+        description: fullList.description,
+        workspaceId: fullList.workspaceId,
+        userId: user.userId,
         members: {
-          create: list.members.map(m => ({
+          create: fullList.members.map(m => ({
             contactId: m.contactId,
             membershipStatus: m.membershipStatus
           }))

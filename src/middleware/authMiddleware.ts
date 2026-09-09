@@ -4,7 +4,7 @@ import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
-export const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' || process.env.VERCEL ? '' : 'dev_local_jwt_secret_only');
+export const JWT_SECRET = process.env.JWT_SECRET || 'tripgain_dev_jwt_secret_change_in_production';
 
 export interface AuthUser {
   userId: string;
@@ -35,12 +35,13 @@ export const authenticateToken = async (req: Request, res: Response, next: NextF
       const decoded = jwt.verify(token, JWT_SECRET) as AuthUser;
       req.user = decoded;
       return next();
-    } catch (error) {
-      // Continue to check fallback headers
+    } catch (error: any) {
+      res.status(401).json({ error: 'Invalid or expired access token. Please log in again.' });
+      return;
     }
   }
 
-  // Fallback to x-user-email or x-user-id
+  // Development/Header fallback (only when no token was provided)
   const headerEmail = (req.headers['x-user-email'] as string) || (req.query.userEmail as string);
   const headerUserId = (req.headers['x-user-id'] as string) || (req.query.userId as string);
 
@@ -64,7 +65,7 @@ export const authenticateToken = async (req: Request, res: Response, next: NextF
     }
   }
 
-  res.status(401).json({ error: 'Access token or user credentials required' });
+  res.status(401).json({ error: 'Authentication required. Please provide a valid Bearer token.' });
 };
 
 export const optionalAuth = async (req: Request, res: Response, next: NextFunction): Promise<void> => {

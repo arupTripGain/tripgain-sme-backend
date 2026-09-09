@@ -1,10 +1,14 @@
 import { Request, Response } from 'express';
 import { AnalyticsService } from '../services/analyticsService';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 export const getCampaignAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
+    const campaignId = campaign.id;
     const { days, startDate, endDate } = req.query;
 
     const parsedDays = days ? parseInt(String(days), 10) : 7;
@@ -38,8 +42,10 @@ export const getCampaignAnalytics = async (req: Request, res: Response): Promise
 export const getCampaignStepAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
 
+    const campaignId = campaign.id;
     const steps = await AnalyticsService.getCampaignStepPerformance(campaignId);
     res.status(200).json(steps);
   } catch (error: any) {
@@ -51,8 +57,10 @@ export const getCampaignStepAnalytics = async (req: Request, res: Response): Pro
 export const getCampaignLinkAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
 
+    const campaignId = campaign.id;
     const links = await AnalyticsService.getCampaignLinkPerformance(campaignId);
     res.status(200).json(links);
   } catch (error: any) {
@@ -64,7 +72,10 @@ export const getCampaignLinkAnalytics = async (req: Request, res: Response): Pro
 export const getCampaignContactAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
+    const campaignId = campaign.id;
     const filter = String(req.query.filter || 'ALL');
 
     const contacts = await AnalyticsService.getCampaignContactEngagement(campaignId, filter);
@@ -78,8 +89,10 @@ export const getCampaignContactAnalytics = async (req: Request, res: Response): 
 export const getContactTimeline = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id, enrollmentId } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
 
+    const campaignId = campaign.id;
     const timeline = await AnalyticsService.getContactActivityTimeline(campaignId, String(enrollmentId));
     res.status(200).json(timeline);
   } catch (error: any) {
@@ -91,8 +104,10 @@ export const getContactTimeline = async (req: Request, res: Response): Promise<v
 export const exportCampaignAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaignId = String(id);
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
 
+    const campaignId = campaign.id;
     const csvData = await AnalyticsService.exportCampaignAnalyticsCsv(campaignId);
 
     res.setHeader('Content-Type', 'text/csv');

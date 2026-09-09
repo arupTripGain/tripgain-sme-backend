@@ -1,39 +1,24 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
 export const getDashboardStats = async (req: Request, res: Response): Promise<void> => {
   try {
-    // We assume workspaceId is typically passed via auth token, but for now we'll fetch across all or assume a default.
-    // For this implementation, we'll fetch global counts since auth isn't fully enforced yet.
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
 
-    const totalLeads = await prisma.contact.count();
-    const emailsSent = await prisma.emailMessage.count({ where: { status: { in: ['sent', 'delivered'] } } });
-    
-    // Replies can be counted from EmailEvent where eventType = 'replied'
-    const replies = await prisma.emailEvent.count({ where: { eventType: 'replied' } });
-    
-    // "Interested" could be tracked via Conversions or Conversation replyClassification. 
-    // Let's use Conversation with positive interest status if available, or just fallback to 0.
-    const interested = await prisma.conversation.count({ where: { interestStatus: 'INTERESTED' } });
-    
-    const registered = await prisma.conversion.count({ where: { conversionType: 'registered' } });
-    
-    const unsubscribed = await prisma.suppressionList.count({ where: { reason: 'unsubscribe' } });
-
-    // Recent Activity (Today)
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const recentActivity = await prisma.activityLog.findMany({
-      where: { createdAt: { gte: today } },
-      orderBy: { createdAt: 'desc' },
-      take: 5
+    const totalLeads = await prisma.contact.count({
+      where: { userId: user.userId }
     });
 
-    // Active Campaigns Performance
-    const campaigns = await prisma.campaign.findMany({
-      where: { status: 'active' },
+    const orConditions: Array<{ userId: string } | { owner: string }> = [{ userId: user.userId }];
+    if (user.name) orConditions.push({ owner: user.name });
+    if (user.email) orConditions.push({ owner: user.email });
+
+    const userCampaigns = await prisma.campaign.findMany({
+      where: { OR: orConditions },
       include: {
         _count: {
           select: {
@@ -44,22 +29,80 @@ export const getDashboardStats = async (req: Request, res: Response): Promise<vo
           }
         }
       },
+      orderBy: { createdAt: 'desc' }
+    });
+    const userCampaignIds = userCampaigns.map(c => c.id);
+
+    let emailsSent = 0;
+    let replies = 0;
+    let interested = 0;
+    let registered = 0;
+
+    if (userCampaignIds.length > 0) {
+      emailsSent = await prisma.emailMessage.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] }
+        }
+      });
+      replies = await prisma.emailEvent.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          eventType: { in: ['replied', 'email.replied'] }
+        }
+      });
+      interested = await prisma.conversation.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          interestStatus: 'INTERESTED'
+        }
+      });
+      registered = await prisma.conversion.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          conversionType: 'registered'
+        }
+      });
+    }
+
+    const unsubscribed = await prisma.suppressionList.count({
+      where: {
+        userId: user.userId,
+        reason: 'unsubscribe'
+      }
+    });
+
+    // Recent Activity (Today) scoped to user
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const recentActivity = await prisma.activityLog.findMany({
+      where: {
+        userId: user.userId,
+        createdAt: { gte: today }
+      },
+      orderBy: { createdAt: 'desc' },
       take: 5
     });
 
-    // Upcoming sends could be fetched from Enrollment nextSendAt
-    const upcomingSends = await prisma.enrollment.findMany({
-      where: { 
-        status: 'active',
-        nextSendAt: { not: null, gt: new Date() }
-      },
-      include: {
-        contact: true,
-        campaign: true
-      },
-      orderBy: { nextSendAt: 'asc' },
-      take: 5
-    });
+    // Upcoming sends scoped to user campaigns
+    let upcomingSends: any[] = [];
+    if (userCampaignIds.length > 0) {
+      upcomingSends = await prisma.enrollment.findMany({
+        where: { 
+          campaignId: { in: userCampaignIds },
+          status: 'active',
+          nextSendAt: { not: null, gt: new Date() }
+        },
+        include: {
+          contact: true,
+          campaign: true
+        },
+        orderBy: { nextSendAt: 'asc' },
+        take: 5
+      });
+    }
+
+    const activeCampaigns = userCampaigns.filter(c => c.status === 'active').slice(0, 5);
 
     res.status(200).json({
       stats: {
@@ -72,12 +115,12 @@ export const getDashboardStats = async (req: Request, res: Response): Promise<vo
       },
       recentActivity,
       upcomingSends,
-      campaigns: campaigns.map(c => ({
+      campaigns: activeCampaigns.map(c => ({
         id: c.id,
         name: c.name,
         leads: c._count.enrollments,
         sent: c._count.messages,
-        replies: c._count.events, // simplistic mapping, ideally we filter by eventType=replied
+        replies: c._count.events,
         interested: 0,
         registered: c._count.conversions
       }))

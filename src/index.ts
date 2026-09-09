@@ -61,68 +61,68 @@ import { authenticateToken, optionalAuth } from './middleware/authMiddleware';
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Global user identity & auth middleware
+// Global user identity & auth middleware (populates req.user if bearer token present)
 app.use('/api', optionalAuth);
 
 // Auth & Team routes
 app.post('/api/auth/login', login);
 app.post('/api/auth/register', register);
-app.get('/api/auth/me', optionalAuth, getMe);
-app.get('/api/auth/users', optionalAuth, getUsers);
-app.post('/api/auth/users', optionalAuth, register);
-app.delete('/api/auth/users/:id', optionalAuth, deleteUser);
+app.get('/api/auth/me', authenticateToken, getMe);
+app.get('/api/auth/users', authenticateToken, getUsers);
+app.post('/api/auth/users', authenticateToken, register);
+app.delete('/api/auth/users/:id', authenticateToken, deleteUser);
 
-// Contact routes
-app.post('/api/contacts/bulk-personalize', startBulkPersonalization);
-app.get('/api/contacts/personalization-jobs/:jobId', getBulkJobStatus);
-app.post('/api/contacts/:id/personalize', personalizeContact);
-app.put('/api/contacts/:id/personalize', editPersonalization);
-app.post('/api/contacts/bulk-import', bulkImportContacts);
-app.post('/api/contacts', createContact);
-app.get('/api/contacts', getContacts);
-app.get('/api/contacts/:id', getContactById);
-app.put('/api/contacts/:id', updateContact);
-app.delete('/api/contacts/:id', deleteContact);
-app.post('/api/contacts/export', exportContacts);
-app.post('/api/contacts/bulk-delete', bulkDeleteContacts);
+// Contact routes (Strictly authenticated & user-isolated)
+app.post('/api/contacts/bulk-personalize', authenticateToken, startBulkPersonalization);
+app.get('/api/contacts/personalization-jobs/:jobId', authenticateToken, getBulkJobStatus);
+app.post('/api/contacts/:id/personalize', authenticateToken, personalizeContact);
+app.put('/api/contacts/:id/personalize', authenticateToken, editPersonalization);
+app.post('/api/contacts/bulk-import', authenticateToken, bulkImportContacts);
+app.post('/api/contacts', authenticateToken, createContact);
+app.get('/api/contacts', authenticateToken, getContacts);
+app.get('/api/contacts/:id', authenticateToken, getContactById);
+app.put('/api/contacts/:id', authenticateToken, updateContact);
+app.delete('/api/contacts/:id', authenticateToken, deleteContact);
+app.post('/api/contacts/export', authenticateToken, exportContacts);
+app.post('/api/contacts/bulk-delete', authenticateToken, bulkDeleteContacts);
 
 // Organization routes
-app.post('/api/organizations', createOrganization);
-app.get('/api/organizations', getOrganizations);
+app.post('/api/organizations', authenticateToken, createOrganization);
+app.get('/api/organizations', authenticateToken, getOrganizations);
 
-// List routes
-app.post('/api/lists', createList);
-app.get('/api/lists', getLists);
-app.get('/api/lists/:id/personalization-stats', getListPersonalizationStats);
-app.get('/api/lists/:id', getListById);
-app.put('/api/lists/:id', updateList);
-app.delete('/api/lists/:id', deleteList);
-app.post('/api/lists/:id/duplicate', duplicateList);
-app.post('/api/lists/:id/members', addMembersToList);
-app.delete('/api/lists/:id/members', removeMembersFromList);
+// List routes (Strictly authenticated & user-isolated)
+app.post('/api/lists', authenticateToken, createList);
+app.get('/api/lists', authenticateToken, getLists);
+app.get('/api/lists/:id/personalization-stats', authenticateToken, getListPersonalizationStats);
+app.get('/api/lists/:id', authenticateToken, getListById);
+app.put('/api/lists/:id', authenticateToken, updateList);
+app.delete('/api/lists/:id', authenticateToken, deleteList);
+app.post('/api/lists/:id/duplicate', authenticateToken, duplicateList);
+app.post('/api/lists/:id/members', authenticateToken, addMembersToList);
+app.delete('/api/lists/:id/members', authenticateToken, removeMembersFromList);
 
-// Campaign routes
-app.post('/api/campaigns/compose', composeCampaign);
-app.post('/api/campaigns/:id/activate', activateCampaign);
-app.post('/api/campaigns/:id/pause', pauseCampaign);
-app.post('/api/campaigns/:id/duplicate', duplicateCampaign);
-app.get('/api/campaigns', getCampaigns);
-app.get('/api/campaigns/eligibility', getEligibilityPreview);
-app.get('/api/campaigns/:id', getCampaignById);
-app.get('/api/campaigns/:id/audit-logs', getCampaignAuditLogs);
-app.get('/api/analytics', getGlobalAnalytics);
-app.get('/api/dashboard', getDashboardStats);
-app.get('/api/campaigns/:id/analytics', getCampaignAnalytics);
-app.get('/api/campaigns/:id/analytics/steps', getCampaignStepAnalytics);
-app.get('/api/campaigns/:id/analytics/links', getCampaignLinkAnalytics);
-app.get('/api/campaigns/:id/analytics/contacts', getCampaignContactAnalytics);
-app.get('/api/campaigns/:id/analytics/contacts/:enrollmentId/timeline', getContactTimeline);
-app.get('/api/campaigns/:id/analytics/export', exportCampaignAnalytics);
-app.get('/api/campaigns/:id/leads', getCampaignLeads);
-app.put('/api/campaigns/:id', updateCampaign);
-app.put('/api/campaigns/:id/steps', updateCampaignSteps);
-app.post('/api/campaigns/draft', generateLeadDraft);
-app.delete('/api/campaigns/:id', deleteCampaign);
+// Campaign routes (Strictly authenticated & user-isolated)
+app.post('/api/campaigns/compose', authenticateToken, composeCampaign);
+app.post('/api/campaigns/:id/activate', authenticateToken, activateCampaign);
+app.post('/api/campaigns/:id/pause', authenticateToken, pauseCampaign);
+app.post('/api/campaigns/:id/duplicate', authenticateToken, duplicateCampaign);
+app.get('/api/campaigns', authenticateToken, getCampaigns);
+app.get('/api/campaigns/eligibility', authenticateToken, getEligibilityPreview);
+app.get('/api/campaigns/:id', authenticateToken, getCampaignById);
+app.get('/api/campaigns/:id/audit-logs', authenticateToken, getCampaignAuditLogs);
+app.get('/api/analytics', authenticateToken, getGlobalAnalytics);
+app.get('/api/dashboard', authenticateToken, getDashboardStats);
+app.get('/api/campaigns/:id/analytics', authenticateToken, getCampaignAnalytics);
+app.get('/api/campaigns/:id/analytics/steps', authenticateToken, getCampaignStepAnalytics);
+app.get('/api/campaigns/:id/analytics/links', authenticateToken, getCampaignLinkAnalytics);
+app.get('/api/campaigns/:id/analytics/contacts', authenticateToken, getCampaignContactAnalytics);
+app.get('/api/campaigns/:id/analytics/contacts/:enrollmentId/timeline', authenticateToken, getContactTimeline);
+app.get('/api/campaigns/:id/analytics/export', authenticateToken, exportCampaignAnalytics);
+app.get('/api/campaigns/:id/leads', authenticateToken, getCampaignLeads);
+app.put('/api/campaigns/:id', authenticateToken, updateCampaign);
+app.put('/api/campaigns/:id/steps', authenticateToken, updateCampaignSteps);
+app.post('/api/campaigns/draft', authenticateToken, generateLeadDraft);
+app.delete('/api/campaigns/:id', authenticateToken, deleteCampaign);
 
 import { handleRedirect, handleOpenTracking } from './controllers/trackingController';
 import { simulateEvent, handleProviderWebhook } from './controllers/webhookController';
@@ -130,7 +130,7 @@ import { getConversations, getConversationById, replyToConversation, performConv
 import aiRoutes from './routes/aiRoutes';
 
 // AI Routes
-app.use('/api/ai', aiRoutes);
+app.use('/api/ai', authenticateToken, aiRoutes);
 
 // Phase 6 Engine & Tracking
 app.get('/api/scheduler/tick', runTick);
@@ -140,25 +140,25 @@ app.post('/api/webhooks/email-provider', handleProviderWebhook); // Phase 9
 app.get('/t/:trackingToken', handleOpenTracking); // Open tracking pixel
 app.get('/track/open/:trackingToken', handleOpenTracking);
 app.get('/r/:trackingToken', handleRedirect); // Phase 9 click tracking
-app.post('/api/campaigns/:id/enroll', enrollLeads);
-app.put('/api/campaigns/:id/enrollments/:enrollmentId/status', updateEnrollmentStatus);
+app.post('/api/campaigns/:id/enroll', authenticateToken, enrollLeads);
+app.put('/api/campaigns/:id/enrollments/:enrollmentId/status', authenticateToken, updateEnrollmentStatus);
 
-// Phase 10 Unibox
-app.get('/api/unibox', getConversations);
-app.post('/api/unibox/simulate-reply', simulateLeadReply);
-app.post('/api/unibox/sync', syncReplies);
-app.get('/api/unibox/:id', getConversationById);
-app.post('/api/unibox/:id/reply', replyToConversation);
-app.post('/api/unibox/:id/:action', performConversationAction);
+// Phase 10 Unibox (Strictly authenticated & user-isolated)
+app.get('/api/unibox', authenticateToken, getConversations);
+app.post('/api/unibox/simulate-reply', authenticateToken, simulateLeadReply);
+app.post('/api/unibox/sync', authenticateToken, syncReplies);
+app.get('/api/unibox/:id', authenticateToken, getConversationById);
+app.post('/api/unibox/:id/reply', authenticateToken, replyToConversation);
+app.post('/api/unibox/:id/:action', authenticateToken, performConversationAction);
 
-// Phase 7 Mailboxes
-app.get('/api/mailboxes', getMailboxes);
-app.post('/api/mailboxes/smtp-imap', connectSmtpImap);
-app.delete('/api/mailboxes/:id', disconnectMailbox);
-app.put('/api/mailboxes/:id', updateMailboxLimits);
-app.patch('/api/mailboxes/:id/limits', updateMailboxLimits);
-app.post('/api/mailboxes/:id/test', testMailbox);
-app.post('/api/mailboxes/:id/send-test', sendTestEmail);
+// Phase 7 Mailboxes (Strictly authenticated & user-isolated)
+app.get('/api/mailboxes', authenticateToken, getMailboxes);
+app.post('/api/mailboxes/smtp-imap', authenticateToken, connectSmtpImap);
+app.delete('/api/mailboxes/:id', authenticateToken, disconnectMailbox);
+app.put('/api/mailboxes/:id', authenticateToken, updateMailboxLimits);
+app.patch('/api/mailboxes/:id/limits', authenticateToken, updateMailboxLimits);
+app.post('/api/mailboxes/:id/test', authenticateToken, testMailbox);
+app.post('/api/mailboxes/:id/send-test', authenticateToken, sendTestEmail);
 app.get('/api/integrations/google/callback', googleCallback);
 app.get('/api/integrations/microsoft/callback', microsoftCallback);
 

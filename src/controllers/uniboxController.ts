@@ -3,13 +3,16 @@ import { PrismaClient } from '@prisma/client';
 import nodemailer from 'nodemailer';
 import { decrypt } from './mailboxController';
 import { getCalendarBucketBounds, getDispatchedMessageCounts } from '../services/quotaService';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
 export const getConversations = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const tab = req.query.tab as string | undefined;
-    const user = (req as any).user;
     const scope = req.query.scope as string | undefined;
     
     let whereClause: any = {};
@@ -27,7 +30,7 @@ export const getConversations = async (req: Request, res: Response): Promise<voi
     }
 
     // User-level isolation
-    if (user && !(user.role === 'ADMIN' && scope === 'all')) {
+    if (!(user.role === 'ADMIN' && scope === 'all')) {
       const userMailboxes = await prisma.mailbox.findMany({
         where: { userId: user.userId },
         select: { id: true, email: true }
@@ -46,11 +49,17 @@ export const getConversations = async (req: Request, res: Response): Promise<voi
       });
       const userCampaignIds = userCampaigns.map((c: any) => c.id);
 
-      whereClause.OR = [
-        { mailboxId: { in: userMailboxIds } },
-        { campaignId: { in: userCampaignIds } },
-        { assignedTo: user.userId },
-        { assignedTo: user.email }
+      whereClause.AND = [
+        ...(whereClause.AND || []),
+        {
+          OR: [
+            ...(userMailboxIds.length > 0 ? [{ mailboxId: { in: userMailboxIds } }] : []),
+            ...(userCampaignIds.length > 0 ? [{ campaignId: { in: userCampaignIds } }] : []),
+            { contact: { userId: user.userId } },
+            { assignedTo: user.userId },
+            { assignedTo: user.email }
+          ]
+        }
       ];
     }
 
@@ -76,9 +85,11 @@ export const getConversations = async (req: Request, res: Response): Promise<voi
 export const getConversationById = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
+    const conversation = await OwnershipGuard.assertConversation(req, res, id);
+    if (!conversation) return;
     
-    const conversation = await prisma.conversation.findUnique({
-      where: { id },
+    const fullConversation = await prisma.conversation.findUnique({
+      where: { id: conversation.id },
       include: {
         contact: {
           include: { emails: true }
@@ -93,12 +104,12 @@ export const getConversationById = async (req: Request, res: Response): Promise<
       }
     });
 
-    if (!conversation) {
+    if (!fullConversation) {
       res.status(404).json({ error: 'Conversation not found' });
       return;
     }
 
-    res.status(200).json(conversation);
+    res.status(200).json(fullConversation);
   } catch (error) {
     console.error('Error fetching conversation:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
@@ -107,31 +118,33 @@ export const getConversationById = async (req: Request, res: Response): Promise<
 
 export const replyToConversation = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const id = req.params.id as string;
+    const conversation = await OwnershipGuard.assertConversation(req, res, id);
+    if (!conversation) return;
+
     const { bodyText, bodyHtml } = req.body;
 
-    const conversation = await prisma.conversation.findUnique({
-      where: { id },
+    const fullConversation = await prisma.conversation.findUnique({
+      where: { id: conversation.id },
       include: { contact: { include: { emails: true } } }
     });
 
-    if (!conversation) {
+    if (!fullConversation) {
       res.status(404).json({ error: 'Conversation not found' });
       return;
     }
 
-    const primaryEmail = conversation.contact?.emails?.find((e: any) => e.isPrimary)?.email || conversation.contact?.emails?.[0]?.email || '';
+    const primaryEmail = fullConversation.contact?.emails?.find((e: any) => e.isPrimary)?.email || fullConversation.contact?.emails?.[0]?.email || '';
 
-    // Find the active connected mailbox for this user (or fallback to active mailbox)
-    const user = (req as any).user;
-    let mailbox = null;
-    if (user) {
-      mailbox = await prisma.mailbox.findFirst({
-        where: { userId: user.userId, status: 'CONNECTED', isActive: true },
-        include: { credentials: true }
-      });
-    }
-    if (!mailbox) {
+    // Find the active connected mailbox for this user
+    let mailbox = await prisma.mailbox.findFirst({
+      where: { userId: user.userId, status: 'CONNECTED', isActive: true },
+      include: { credentials: true }
+    });
+    if (!mailbox && user.role === 'ADMIN') {
       mailbox = await prisma.mailbox.findFirst({
         where: { status: 'CONNECTED', isActive: true },
         include: { credentials: true }
@@ -173,7 +186,7 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
         await transporter.sendMail({
           from: `"${mailbox.displayName || mailbox.email}" <${mailbox.email}>`,
           to: primaryEmail,
-          subject: `Re: ${conversation.subject || 'Follow up'}`,
+          subject: `Re: ${fullConversation.subject || 'Follow up'}`,
           text: bodyText,
           html: bodyHtml || `<div style="font-family: sans-serif; white-space: pre-wrap; line-height: 1.6;">${bodyText}</div>`
         });
@@ -193,16 +206,19 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
       }
     }
 
+    const senderName = mailbox?.displayName || user.name || 'Outreach Team';
+    const senderEmail = mailbox?.email || user.email || 'outreach@tripgainapp.com';
+
     // Create the manual reply message
     const message = await prisma.conversationMessage.create({
       data: {
-        conversationId: id,
+        conversationId: fullConversation.id,
         direction: 'OUTBOUND',
         messageType: 'EMAIL',
-        senderName: mailbox?.displayName || 'Arup Nirala',
-        senderEmail: mailbox?.email || 'arup.nirala@tripgainapp.com', 
+        senderName,
+        senderEmail, 
         recipientEmails: [primaryEmail],
-        subject: `Re: ${conversation.subject || 'Follow up'}`,
+        subject: `Re: ${fullConversation.subject || 'Follow up'}`,
         bodyText,
         bodyHtml,
         isRead: true,
@@ -212,7 +228,7 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
 
     // Update conversation status
     const updatedConv = await prisma.conversation.update({
-      where: { id },
+      where: { id: fullConversation.id },
       data: {
         status: 'OPEN', // No longer NEEDS_ACTION
         latestMessageAt: new Date(),
@@ -240,8 +256,10 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
 export const performConversationAction = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
+    const conversation = await OwnershipGuard.assertConversation(req, res, id);
+    if (!conversation) return;
+
     const action = req.params.action as string;
-    
     let updateData: any = {};
 
     switch (action) {
@@ -266,13 +284,13 @@ export const performConversationAction = async (req: Request, res: Response): Pr
     }
 
     const updated = await prisma.conversation.update({
-      where: { id },
+      where: { id: conversation.id },
       data: updateData
     });
 
     await prisma.conversationAction.create({
       data: {
-        conversationId: id,
+        conversationId: conversation.id,
         actionType: action?.toUpperCase() || 'UNKNOWN',
         performedBy: 'System',
       }
@@ -287,11 +305,17 @@ export const performConversationAction = async (req: Request, res: Response): Pr
 
 export const simulateLeadReply = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { contactEmail, leadName, companyName, messageText } = req.body;
     
-    // Find or create a contact to simulate the reply from
+    // Find or create a contact scoped to current user
     let contact: any = await prisma.contact.findFirst({
-      where: contactEmail ? { emails: { some: { email: contactEmail } } } : {},
+      where: {
+        userId: user.userId,
+        ...(contactEmail ? { emails: { some: { email: contactEmail } } } : {})
+      },
       include: { emails: true, organization: true }
     });
 
@@ -317,6 +341,7 @@ export const simulateLeadReply = async (req: Request, res: Response): Promise<vo
       contact = await prisma.contact.create({
         data: {
           workspaceId: workspace?.id || '',
+          userId: user.userId,
           organizationId: org?.id || null,
           firstName: name.split(' ')[0] || 'Rahul',
           lastName: name.split(' ')[1] || 'Sharma',
@@ -330,7 +355,8 @@ export const simulateLeadReply = async (req: Request, res: Response): Promise<vo
       });
     }
 
-    const defaultText = messageText || `Hi Arup,\n\nThanks for reaching out! We are currently looking for an all-in-one corporate travel and expense management tool for our 65-person team.\n\nCould you share your pricing plans and whether TripGain integrates with corporate cards?\n\nBest regards,\n${contact.fullName || 'Rahul Sharma'}`;
+    const recipientGreeting = user.name ? user.name.split(' ')[0] : 'there';
+    const defaultText = messageText || `Hi ${recipientGreeting},\n\nThanks for reaching out! We are currently looking for an all-in-one corporate travel and expense management tool for our 65-person team.\n\nCould you share your pricing plans and whether TripGain integrates with corporate cards?\n\nBest regards,\n${contact.fullName || 'Rahul Sharma'}`;
 
     // Create Conversation
     const conversation = await prisma.conversation.create({
@@ -381,6 +407,10 @@ export const simulateLeadReply = async (req: Request, res: Response): Promise<vo
 export const syncReplies = async (req: Request, res: Response): Promise<void> => {
   try {
     const { mailboxId } = req.body || {};
+    if (mailboxId) {
+      const mailbox = await OwnershipGuard.assertMailbox(req, res, mailboxId);
+      if (!mailbox) return;
+    }
     const { syncMailboxReplies } = await import('../services/imapSyncService');
     const result = await syncMailboxReplies(mailboxId);
     

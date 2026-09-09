@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { getCalendarBucketBounds, getDispatchedMessageCounts } from '../services/quotaService';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 function getEncryptionKey(): Buffer {
@@ -51,18 +52,16 @@ export function decrypt(text: string): string {
 
 export const getMailboxes = async (req: Request, res: Response): Promise<void> => {
   try {
-    const user = (req as any).user;
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const scope = req.query.scope as string | undefined;
 
     let whereClause: any = {};
-
-    if (user) {
-      if (user.role === 'ADMIN' && scope === 'all') {
-        // Admin requested to view all workspace mailboxes
-      } else {
-        // Standard user or default admin view: only show mailboxes owned by this user
-        whereClause.userId = user.userId;
-      }
+    if (user.role === 'ADMIN' && scope === 'all') {
+      // Admin requested to view all workspace mailboxes
+    } else {
+      whereClause.userId = user.userId;
     }
 
     const mailboxes = await prisma.mailbox.findMany({
@@ -236,9 +235,16 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
     const finalImapHost = isGoogle ? 'imap.gmail.com' : (imapHost || 'imap.gmail.com');
     const finalImapPort = isGoogle ? 993 : Number(imapPort || 993);
 
-    const user = (req as any).user;
-    const userId = user?.userId || null;
-    const ownerName = user?.name || user?.email || null;
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+    const userId = user.userId;
+    const ownerName = user.name || user.email || 'User';
+
+    const existingMailbox = await prisma.mailbox.findUnique({ where: { email: cleanEmail } });
+    if (existingMailbox && existingMailbox.userId && existingMailbox.userId !== user.userId && user.role !== 'ADMIN') {
+      res.status(403).json({ error: 'This email address is already connected by another user.' });
+      return;
+    }
 
     // Test SMTP Authentication
     try {
@@ -272,8 +278,8 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
     const mailbox = await prisma.mailbox.upsert({
       where: { email: cleanEmail },
       update: {
-        userId: userId || undefined,
-        ownerName: ownerName || undefined,
+        userId: userId,
+        ownerName: ownerName,
         displayName: displayName?.trim() || cleanEmail,
         provider: isGoogle ? 'GOOGLE' : provider,
         connectionType: 'SMTP_IMAP',
@@ -341,27 +347,17 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
 export const disconnectMailbox = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const user = (req as any).user;
-
-    const existing = await prisma.mailbox.findUnique({ where: { id } });
-    if (!existing) {
-      res.status(404).json({ error: 'Mailbox not found' });
-      return;
-    }
-
-    if (user && user.role !== 'ADMIN' && existing.userId && existing.userId !== user.userId) {
-      res.status(403).json({ error: 'Unauthorized: You can only disconnect your own mailbox' });
-      return;
-    }
+    const mailbox = await OwnershipGuard.assertMailbox(req, res, id);
+    if (!mailbox) return;
     
     // Delete credentials
     await prisma.mailboxCredential.deleteMany({
-      where: { mailboxId: id }
+      where: { mailboxId: mailbox.id }
     });
 
     // Update mailbox status
     const updated = await prisma.mailbox.update({
-      where: { id },
+      where: { id: mailbox.id },
       data: {
         status: 'DISCONNECTED',
         isActive: false,
@@ -381,7 +377,9 @@ export const disconnectMailbox = async (req: Request, res: Response): Promise<vo
 export const updateMailboxLimits = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const user = (req as any).user;
+    const mailbox = await OwnershipGuard.assertMailbox(req, res, id);
+    if (!mailbox) return;
+
     const { 
       dailySendLimit, 
       hourlySendLimit, 
@@ -393,19 +391,8 @@ export const updateMailboxLimits = async (req: Request, res: Response): Promise<
       warmupStatus
     } = req.body;
 
-    const mailbox = await prisma.mailbox.findUnique({ where: { id } });
-    if (!mailbox) {
-      res.status(404).json({ error: 'Mailbox not found' });
-      return;
-    }
-
-    if (user && user.role !== 'ADMIN' && mailbox.userId && mailbox.userId !== user.userId) {
-      res.status(403).json({ error: 'Unauthorized: You can only update your own mailbox' });
-      return;
-    }
-
     const updated = await prisma.mailbox.update({
-      where: { id },
+      where: { id: mailbox.id },
       data: {
         ...(dailySendLimit !== undefined && { dailySendLimit: Math.max(1, Number(dailySendLimit)) }),
         ...(hourlySendLimit !== undefined && { hourlySendLimit: Math.max(1, Number(hourlySendLimit)) }),
@@ -428,20 +415,23 @@ export const updateMailboxLimits = async (req: Request, res: Response): Promise<
 export const testMailbox = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const mailbox = await prisma.mailbox.findUnique({
-      where: { id },
+    const mailbox = await OwnershipGuard.assertMailbox(req, res, id);
+    if (!mailbox) return;
+
+    const fullMailbox = await prisma.mailbox.findUnique({
+      where: { id: mailbox.id },
       include: { credentials: true }
     });
 
-    if (!mailbox || !mailbox.credentials) {
+    if (!fullMailbox || !fullMailbox.credentials) {
       res.status(404).json({ error: 'Mailbox or credentials not found' });
       return;
     }
 
-    const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
-    const smtpPort = mailbox.credentials.encryptedSmtpPort ? Number(decrypt(mailbox.credentials.encryptedSmtpPort)) : 465;
-    const smtpUser = mailbox.credentials.encryptedSmtpUsername ? decrypt(mailbox.credentials.encryptedSmtpUsername) : mailbox.email;
-    const smtpPass = mailbox.credentials.encryptedSmtpPassword ? decrypt(mailbox.credentials.encryptedSmtpPassword) : '';
+    const smtpHost = fullMailbox.credentials.encryptedSmtpHost ? decrypt(fullMailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
+    const smtpPort = fullMailbox.credentials.encryptedSmtpPort ? Number(decrypt(fullMailbox.credentials.encryptedSmtpPort)) : 465;
+    const smtpUser = fullMailbox.credentials.encryptedSmtpUsername ? decrypt(fullMailbox.credentials.encryptedSmtpUsername) : fullMailbox.email;
+    const smtpPass = fullMailbox.credentials.encryptedSmtpPassword ? decrypt(fullMailbox.credentials.encryptedSmtpPassword) : '';
 
     const transporter = nodemailer.createTransport({
       host: smtpHost,
@@ -459,7 +449,7 @@ export const testMailbox = async (req: Request, res: Response): Promise<void> =>
     await transporter.verify();
 
     await prisma.mailbox.update({
-      where: { id },
+      where: { id: fullMailbox.id },
       data: {
         status: 'CONNECTED',
         smtpStatus: 'CONNECTED',
@@ -485,37 +475,43 @@ export const testMailbox = async (req: Request, res: Response): Promise<void> =>
 
 export const sendTestEmail = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const id = req.params.id as string;
+    const mailbox = await OwnershipGuard.assertMailbox(req, res, id);
+    if (!mailbox) return;
+
     const { toEmail } = req.body;
 
-    const mailbox = await prisma.mailbox.findUnique({
-      where: { id },
+    const fullMailbox = await prisma.mailbox.findUnique({
+      where: { id: mailbox.id },
       include: { credentials: true }
     });
 
-    if (!mailbox || !mailbox.credentials) {
+    if (!fullMailbox || !fullMailbox.credentials) {
       res.status(404).json({ error: 'Mailbox or credentials not found' });
       return;
     }
 
-    const bounds = getCalendarBucketBounds(new Date(), mailbox.sendingTimezone || 'Asia/Kolkata');
+    const bounds = getCalendarBucketBounds(new Date(), fullMailbox.sendingTimezone || 'Asia/Kolkata');
     const bucketCounts = await getDispatchedMessageCounts({
-      mailboxEmail: mailbox.email,
+      mailboxEmail: fullMailbox.email,
       startOfHour: bounds.startOfHour,
       endOfHour: bounds.endOfHour,
       startOfDay: bounds.startOfDay,
       endOfDay: bounds.endOfDay
     });
 
-    if (bucketCounts.mailboxSentToday >= mailbox.dailySendLimit) {
-      res.status(429).json({ error: `Cannot send test email: Mailbox daily sending limit (${mailbox.dailySendLimit}) has been reached for today.` });
+    if (bucketCounts.mailboxSentToday >= fullMailbox.dailySendLimit) {
+      res.status(429).json({ error: `Cannot send test email: Mailbox daily sending limit (${fullMailbox.dailySendLimit}) has been reached for today.` });
       return;
     }
 
-    const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
-    const smtpPort = mailbox.credentials.encryptedSmtpPort ? Number(decrypt(mailbox.credentials.encryptedSmtpPort)) : 465;
-    const smtpUser = mailbox.credentials.encryptedSmtpUsername ? decrypt(mailbox.credentials.encryptedSmtpUsername) : mailbox.email;
-    const smtpPass = mailbox.credentials.encryptedSmtpPassword ? decrypt(mailbox.credentials.encryptedSmtpPassword) : '';
+    const smtpHost = fullMailbox.credentials.encryptedSmtpHost ? decrypt(fullMailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
+    const smtpPort = fullMailbox.credentials.encryptedSmtpPort ? Number(decrypt(fullMailbox.credentials.encryptedSmtpPort)) : 465;
+    const smtpUser = fullMailbox.credentials.encryptedSmtpUsername ? decrypt(fullMailbox.credentials.encryptedSmtpUsername) : fullMailbox.email;
+    const smtpPass = fullMailbox.credentials.encryptedSmtpPassword ? decrypt(fullMailbox.credentials.encryptedSmtpPassword) : '';
 
     const transporter = nodemailer.createTransport({
       host: smtpHost,
@@ -568,7 +564,10 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
     try {
       const workspace = await prisma.workspace.findFirst();
       let contact: any = await prisma.contact.findFirst({
-        where: { emails: { some: { normalizedEmail: targetEmail.toLowerCase() } } },
+        where: { 
+          userId: user.userId,
+          emails: { some: { normalizedEmail: targetEmail.toLowerCase() } } 
+        },
         include: { emails: true }
       });
 
@@ -576,6 +575,7 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
         contact = await prisma.contact.create({
           data: {
             workspaceId: workspace.id,
+            userId: user.userId,
             fullName: targetEmail.split('@')[0],
             firstName: targetEmail.split('@')[0],
             emails: {

@@ -27,6 +27,9 @@ model User {
   workspace       Workspace?  @relation("WorkspaceMembers", fields: [workspaceId], references: [id])
   mailboxes       Mailbox[]
   campaigns       Campaign[]
+  contacts        Contact[]
+  lists           List[]
+  suppressionEntries SuppressionList[]
 }
 
 model Workspace {
@@ -117,6 +120,8 @@ model Contact {
 
   workspace       Workspace       @relation(fields: [workspaceId], references: [id])
   organization    Organization?   @relation(fields: [organizationId], references: [id])
+  userId          String?
+  user            User?           @relation(fields: [userId], references: [id])
   
   emails          ContactEmail[]
   listMemberships ListMember[]
@@ -125,6 +130,9 @@ model Contact {
   emailEvents     EmailEvent[]
   conversations   Conversation[]
   conversationActions ConversationAction[]
+
+  @@index([userId])
+  @@index([userId, createdAt])
 }
 
 model ContactEmail {
@@ -160,8 +168,12 @@ model List {
   updatedAt   DateTime @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id])
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id])
   members   ListMember[]
   campaigns Campaign[]
+
+  @@index([userId])
 }
 
 model ListMember {
@@ -185,8 +197,12 @@ model SuppressionList {
   reason          String   // unsubscribe, hard_bounce, spam_complaint, do_not_contact
   source          String?
   notes           String?
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id])
   suppressedAt    DateTime @default(now())
   expiresAt       DateTime?
+
+  @@index([userId])
 }
 
 // ==================================================
@@ -552,6 +568,7 @@ model Conversion {
 model ActivityLog {
   id          String   @id @default(uuid())
   workspaceId String
+  userId      String?
   action      String   // contact_imported, campaign_created, etc
   description String?
   entityType  String?
@@ -560,6 +577,8 @@ model ActivityLog {
   createdAt   DateTime @default(now())
   
   workspace Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@index([userId])
 }
 
 // ==================================================
@@ -668,6 +687,7 @@ model SchedulerRun {
 model PersonalizationJob {
   id          String    @id @default(uuid())
   workspaceId String
+  userId      String?
   status      String    @default("PENDING") // PENDING, PROCESSING, COMPLETED, FAILED
   total       Int       @default(0)
   processed   Int       @default(0)
@@ -676,4 +696,6 @@ model PersonalizationJob {
   contactIds  Json      // array of contact IDs
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+
+  @@index([userId])
 }

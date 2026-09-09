@@ -196,25 +196,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
     const userId = req.user?.userId;
 
     if (!userId) {
-      // Fallback to first admin user if unauthenticated
-      const defaultUser = await prisma.user.findFirst({
-        include: { workspace: true, ownedWorkspaces: true }
-      });
-      if (defaultUser) {
-        res.status(200).json({
-          user: {
-            id: defaultUser.id,
-            name: defaultUser.name,
-            email: defaultUser.email,
-            role: defaultUser.role,
-            avatarUrl: defaultUser.avatarUrl,
-            workspaceId: defaultUser.workspaceId || defaultUser.ownedWorkspaces[0]?.id
-          },
-          workspace: defaultUser.workspace || defaultUser.ownedWorkspaces[0]
-        });
-        return;
-      }
-      res.status(401).json({ error: 'Not authenticated' });
+      res.status(401).json({ error: 'Authentication required. Please log in.' });
       return;
     }
 
@@ -249,10 +231,21 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 };
 
 // ---------------------------------------------------------------------
-// 4. List All Users (Team Management)
+// 4. List All Users (Team Management - Admin Only)
 // ---------------------------------------------------------------------
 export const getUsers = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = req.user;
+    if (!user) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
+    if (user.role !== 'ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Admin privilege required' });
+      return;
+    }
+
     const users = await prisma.user.findMany({
       select: {
         id: true,

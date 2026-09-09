@@ -1,31 +1,72 @@
 import { Request, Response } from 'express';
 import { PrismaClient, Campaign, ActivityLog } from '@prisma/client';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
 export const getGlobalAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
-    const totalContacts = await prisma.contact.count();
-    const sent = await prisma.emailMessage.count({ where: { status: { in: ['sent', 'delivered'] } } });
-    let delivered = await prisma.emailMessage.count({ where: { status: 'delivered' } });
-    if (delivered === 0 && sent > 0) delivered = sent;
-    const repliedEnrollments = await prisma.enrollment.count({ where: { status: 'replied' } });
-    const repliedEvents = await prisma.emailEvent.count({ where: { eventType: 'replied' } });
-    const replies = Math.max(repliedEnrollments, repliedEvents);
-    const unsubscribed = await prisma.emailEvent.count({ where: { eventType: 'unsubscribed' } });
-    
-    // Fetch some real campaigns for performance metrics
-    const campaigns = await prisma.campaign.findMany({
-      take: 5,
-      orderBy: { createdAt: 'desc' }
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
+    const totalContacts = await prisma.contact.count({
+      where: { userId: user.userId }
     });
 
-    const campaignPerformance = await Promise.all(campaigns.map(async (c: Campaign) => {
-      const cSent = await prisma.emailMessage.count({ where: { campaignId: c.id, status: { in: ['sent', 'delivered'] } } });
-      let cDelivered = await prisma.emailMessage.count({ where: { campaignId: c.id, status: 'delivered' } });
+    // Fetch user campaigns
+    const orConditions: Array<{ userId: string } | { owner: string }> = [{ userId: user.userId }];
+    if (user.name) orConditions.push({ owner: user.name });
+    if (user.email) orConditions.push({ owner: user.email });
+
+    const userCampaigns = await prisma.campaign.findMany({
+      where: { OR: orConditions },
+      orderBy: { createdAt: 'desc' }
+    });
+    const userCampaignIds = userCampaigns.map(c => c.id);
+
+    let sent = 0;
+    let delivered = 0;
+    let replies = 0;
+    let unsubscribed = 0;
+
+    if (userCampaignIds.length > 0) {
+      sent = await prisma.emailMessage.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] }
+        }
+      });
+      delivered = await prisma.emailMessage.count({
+        where: {
+          campaignId: { in: userCampaignIds },
+          status: { in: ['delivered', 'opened', 'clicked', 'replied'] }
+        }
+      });
+      if (delivered === 0 && sent > 0) delivered = sent;
+
+      const repliedEnrollments = await prisma.enrollment.count({
+        where: { campaignId: { in: userCampaignIds }, status: 'replied' }
+      });
+      const repliedEvents = await prisma.emailEvent.count({
+        where: { campaignId: { in: userCampaignIds }, eventType: { in: ['replied', 'email.replied'] } }
+      });
+      replies = Math.max(repliedEnrollments, repliedEvents);
+
+      unsubscribed = await prisma.emailEvent.count({
+        where: { campaignId: { in: userCampaignIds }, eventType: { in: ['unsubscribed', 'email.unsubscribed'] } }
+      });
+    }
+
+    const campaignPerformance = await Promise.all(userCampaigns.slice(0, 5).map(async (c: Campaign) => {
+      const cSent = await prisma.emailMessage.count({
+        where: { campaignId: c.id, status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] } }
+      });
+      let cDelivered = await prisma.emailMessage.count({
+        where: { campaignId: c.id, status: { in: ['delivered', 'opened', 'clicked', 'replied'] } }
+      });
       if (cDelivered === 0 && cSent > 0) cDelivered = cSent;
       const cRepliedEnrollments = await prisma.enrollment.count({ where: { campaignId: c.id, status: 'replied' } });
-      const cRepliedEvents = await prisma.emailEvent.count({ where: { campaignId: c.id, eventType: 'replied' } });
+      const cRepliedEvents = await prisma.emailEvent.count({ where: { campaignId: c.id, eventType: { in: ['replied', 'email.replied'] } } });
       const cReplies = Math.max(cRepliedEnrollments, cRepliedEvents);
       const cContacts = await prisma.enrollment.count({ where: { campaignId: c.id } });
       return {
@@ -37,8 +78,9 @@ export const getGlobalAnalytics = async (req: Request, res: Response): Promise<v
       };
     }));
 
-    // Fetch actual recent activity
+    // Fetch actual recent activity scoped to user
     const activityLogs = await prisma.activityLog.findMany({
+      where: { userId: user.userId },
       take: 6,
       orderBy: { createdAt: 'desc' }
     });

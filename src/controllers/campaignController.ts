@@ -1,10 +1,16 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
-const getWorkspace = async () => {
-  let workspace = await prisma.workspace.findFirst();
+const getWorkspace = async (userId?: string) => {
+  let workspace = userId 
+    ? await prisma.workspace.findFirst({ where: { userId } }) 
+    : await prisma.workspace.findFirst();
+  if (!workspace) {
+    workspace = await prisma.workspace.findFirst();
+  }
   if (!workspace) {
     workspace = await prisma.workspace.create({
       data: {
@@ -18,20 +24,20 @@ const getWorkspace = async () => {
 
 export const getCampaigns = async (req: Request, res: Response): Promise<void> => {
   try {
-    const user = (req as any).user;
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const scope = req.query.scope as string | undefined;
 
     let whereClause: any = {};
-    if (user) {
-      if (user.role === 'ADMIN' && scope === 'all') {
-        // Admin viewing all workspace campaigns
-      } else {
-        whereClause.OR = [
-          { userId: user.userId },
-          { owner: user.name },
-          { owner: user.email }
-        ];
-      }
+    if (user.role === 'ADMIN' && scope === 'all') {
+      // Admin specifically viewing workspace-wide campaigns
+    } else {
+      whereClause.OR = [
+        { userId: user.userId },
+        { owner: user.name },
+        { owner: user.email }
+      ];
     }
 
     const campaigns = await prisma.campaign.findMany({
@@ -109,8 +115,11 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
 export const getCampaignById = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: String(id) },
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
+    const fullCampaign = await prisma.campaign.findUnique({
+      where: { id: campaign.id },
       include: {
         list: true,
         sequences: {
@@ -125,15 +134,15 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
         }
       }
     });
-    
-    if (!campaign) {
+
+    if (!fullCampaign) {
       res.status(404).json({ error: 'Campaign not found' });
       return;
     }
 
     const sentCount = await prisma.emailMessage.count({
       where: { 
-        campaignId: campaign.id, 
+        campaignId: fullCampaign.id, 
         OR: [
           { status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] } },
           { sentAt: { not: null }, status: { notIn: ['failed', 'draft', 'pending'] } }
@@ -142,16 +151,16 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
     });
 
     const repliedCount = await prisma.enrollment.count({
-      where: { campaignId: campaign.id, status: 'replied' }
+      where: { campaignId: fullCampaign.id, status: 'replied' }
     });
 
-    const stepsCount = campaign.sequences.reduce((sum, seq) => sum + (seq.steps?.length || 0), 0);
-    const senderEmail = campaign.senderMailboxes?.[0] || null;
-    const replyToEmail = campaign.replyToEmail || senderEmail;
+    const stepsCount = fullCampaign.sequences.reduce((sum, seq) => sum + (seq.steps?.length || 0), 0);
+    const senderEmail = fullCampaign.senderMailboxes?.[0] || null;
+    const replyToEmail = fullCampaign.replyToEmail || senderEmail;
     
     res.status(200).json({
-      ...campaign,
-      enrolledCount: campaign._count.enrollments,
+      ...fullCampaign,
+      enrolledCount: fullCampaign._count.enrollments,
       stepsCount,
       sentCount,
       totalSentMessages: sentCount,
@@ -168,6 +177,9 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
 // Phase 5: Campaign Engine - Compose
 export const composeCampaign = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { 
       name, description, campaignCode, campaignType,
       listId, audienceRules,
@@ -179,15 +191,21 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
       sequenceSteps 
     } = req.body;
     
-    const workspace = await getWorkspace();
+    const workspace = await getWorkspace(user.userId);
     
     let targetListId = listId;
+
+    if (targetListId) {
+      const list = await OwnershipGuard.assertList(req, res, targetListId);
+      if (!list) return;
+    }
 
     // If audienceRules is provided, create a dynamic list for this campaign
     if (audienceRules && Object.keys(audienceRules).length > 0) {
       const newList = await prisma.list.create({
         data: {
           workspaceId: workspace.id,
+          userId: user.userId,
           name: `${name} - Smart Filter`,
           listType: 'dynamic',
           rules: audienceRules
@@ -196,15 +214,14 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
       targetListId = newList.id;
     }
 
-    const user = (req as any).user;
-    const userId = user?.userId || null;
-    const ownerName = user?.name || user?.email || 'Arup Nirala';
+    const userId = user.userId;
+    const ownerName = user.name || user.email || 'User';
 
     // Create Campaign + Sequence + Steps + AuditLog in a transaction
     const campaign = await (prisma as any).campaign.create({
       data: {
         workspaceId: workspace.id,
-        userId: userId || undefined,
+        userId: userId,
         owner: ownerName,
         name,
         campaignCode,
@@ -242,6 +259,7 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
         },
         auditLogs: {
           create: [{
+            userId: userId,
             action: 'Campaign created',
             details: 'Initial campaign configuration saved as draft.'
           }]
@@ -259,35 +277,41 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
 // Phase 5: Campaign Engine - Activate
 export const activateCampaign = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: String(id) },
-      include: { 
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
+    const fullCampaign = await prisma.campaign.findUnique({
+      where: { id: campaign.id },
+      include: {
         sequences: true,
         list: true
       }
     });
     
-    if (!campaign) {
+    if (!fullCampaign) {
       res.status(404).json({ error: 'Campaign not found' });
       return;
     }
-    
-    if (!campaign.listId) {
+
+    if (!fullCampaign.listId) {
       res.status(400).json({ error: 'Campaign has no audience list assigned. Please edit the campaign to assign a list before launching.' });
       return;
     }
     
-    let senderMailboxes = campaign.senderMailboxes || [];
+    let senderMailboxes = fullCampaign.senderMailboxes || [];
     if (senderMailboxes.length === 0) {
       const activeMailbox = await prisma.mailbox.findFirst({
-        where: { workspaceId: campaign.workspaceId, status: 'CONNECTED' }
+        where: { userId: user.userId, status: 'CONNECTED' }
       });
       if (activeMailbox) {
         senderMailboxes = [activeMailbox.email];
         await prisma.campaign.update({
-          where: { id: campaign.id },
+          where: { id: fullCampaign.id },
           data: { senderMailboxes }
         });
       } else {
@@ -296,23 +320,23 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
       }
     }
 
-    let sequenceId = campaign.sequences[0]?.id;
+    let sequenceId = fullCampaign.sequences[0]?.id;
     if (!sequenceId) {
       const newSeq = await prisma.sequence.create({
         data: {
-          campaignId: campaign.id,
+          campaignId: fullCampaign.id,
           name: 'Primary Sequence'
         }
       });
       sequenceId = newSeq.id;
     }
 
-    // 1. Fetch eligible contacts from the List
+    // 1. Fetch eligible contacts from the List, strictly scoped to current user
     let eligibleContactIds: string[] = [];
     
-    if (campaign.list?.listType === 'dynamic' && campaign.list?.rules) {
-      const rules = campaign.list.rules as any;
-      let whereClause: any = { workspaceId: campaign.workspaceId };
+    if (fullCampaign.list?.listType === 'dynamic' && fullCampaign.list?.rules) {
+      const rules = fullCampaign.list.rules as any;
+      let whereClause: any = { userId: user.userId };
       if (rules.city) whereClause.city = { contains: rules.city, mode: 'insensitive' };
       if (rules.jobTitle) whereClause.jobTitle = { contains: rules.jobTitle, mode: 'insensitive' };
       if (rules.industry) {
@@ -327,7 +351,10 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
       
     } else {
       const members = await prisma.listMember.findMany({
-        where: { listId: campaign.listId },
+        where: { 
+          listId: fullCampaign.listId,
+          contact: { userId: user.userId }
+        },
         select: { contactId: true }
       });
       eligibleContactIds = members.map(m => m.contactId);
@@ -336,7 +363,7 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
     // 2. Filter out already enrolled contacts
     const existingEnrollments = await prisma.enrollment.findMany({
       where: {
-        campaignId: campaign.id,
+        campaignId: fullCampaign.id,
         contactId: { in: eligibleContactIds }
       },
       select: { contactId: true }
@@ -349,7 +376,7 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
     if (newContactIds.length > 0) {
       await prisma.enrollment.createMany({
         data: newContactIds.map(contactId => ({
-          campaignId: campaign.id,
+          campaignId: fullCampaign.id,
           sequenceId,
           contactId,
           status: 'active',
@@ -362,7 +389,7 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
     // 4. Reactivate any existing paused enrollments
     await prisma.enrollment.updateMany({
       where: {
-        campaignId: campaign.id,
+        campaignId: fullCampaign.id,
         status: 'paused'
       },
       data: {
@@ -372,13 +399,14 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
     
     // 5. Update campaign status and add audit log
     await prisma.campaign.update({
-      where: { id: campaign.id },
+      where: { id: fullCampaign.id },
       data: { 
         status: 'active', 
         approvalStatus: 'APPROVED',
         startAt: new Date(),
         auditLogs: {
           create: [{
+            userId: user.userId,
             action: 'Campaign activated',
             details: `Activated campaign and sequenced ${newContactIds.length} new contact(s). Total audience: ${eligibleContactIds.length}.`
           }]
@@ -401,20 +429,20 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
 
 export const pauseCampaign = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: String(id) }
-    });
-    if (!campaign) {
-      res.status(404).json({ error: 'Campaign not found' });
-      return;
-    }
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
     await prisma.campaign.update({
       where: { id: campaign.id },
       data: {
         status: 'paused',
         auditLogs: {
           create: [{
+            userId: user.userId,
             action: 'Campaign paused',
             details: 'Campaign was paused by user.'
           }]
@@ -430,9 +458,15 @@ export const pauseCampaign = async (req: Request, res: Response): Promise<void> 
 
 export const duplicateCampaign = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
     const original = await prisma.campaign.findUnique({
-      where: { id: String(id) },
+      where: { id: campaign.id },
       include: {
         sequences: {
           include: {
@@ -449,9 +483,8 @@ export const duplicateCampaign = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    const user = (req as any).user;
-    const userId = user?.userId || original.userId || null;
-    const ownerName = user?.name || user?.email || original.owner || 'Arup Nirala';
+    const userId = user.userId;
+    const ownerName = user.name || user.email || 'User';
 
     const uniqueSuffix = Math.floor(1000 + Math.random() * 9000);
     const newCampaignCode = original.campaignCode 
@@ -461,7 +494,7 @@ export const duplicateCampaign = async (req: Request, res: Response): Promise<vo
     const newCampaign = await prisma.campaign.create({
       data: {
         workspaceId: original.workspaceId,
-        userId: userId || undefined,
+        userId: userId,
         owner: ownerName,
         name: `${original.name} (Copy)`,
         campaignCode: newCampaignCode,
@@ -515,7 +548,7 @@ export const duplicateCampaign = async (req: Request, res: Response): Promise<vo
         },
         auditLogs: {
           create: [{
-            userId: userId || undefined,
+            userId: userId,
             action: 'Campaign duplicated',
             details: `Duplicated from campaign "${original.name}" (${original.id})`
           }]
@@ -543,6 +576,9 @@ export const createCampaign = composeCampaign; // Fallback
 
 export const updateCampaign = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     const campaignId = String(id);
     const {
@@ -555,7 +591,15 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
       sequenceSteps
     } = req.body;
 
-    const existing = await prisma.campaign.findUnique({
+    const existing = await OwnershipGuard.assertCampaign(req, res, campaignId);
+    if (!existing) return;
+
+    if (listId) {
+      const list = await OwnershipGuard.assertList(req, res, listId);
+      if (!list) return;
+    }
+
+    const fullExisting = await prisma.campaign.findUnique({
       where: { id: campaignId },
       include: {
         sequences: {
@@ -564,7 +608,7 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
       }
     });
 
-    if (!existing) {
+    if (!fullExisting) {
       res.status(404).json({ error: 'Campaign not found' });
       return;
     }
@@ -598,7 +642,7 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
 
       // 2. Update sequence steps if provided
       if (Array.isArray(sequenceSteps) && sequenceSteps.length > 0) {
-        let sequenceId: string | undefined = existing.sequences[0]?.id;
+        let sequenceId: string | undefined = fullExisting.sequences[0]?.id;
         if (!sequenceId) {
           const newSeq = await tx.sequence.create({
             data: {
@@ -631,8 +675,9 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
       await tx.auditLog.create({
         data: {
           campaignId,
+          userId: user.userId,
           action: 'Campaign updated',
-          details: 'Campaign settings and sequence steps were updated from admin dashboard.'
+          details: 'Campaign settings and sequence steps were updated from user dashboard.'
         }
       });
     });
@@ -662,10 +707,12 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
 export const updateCampaignSteps = async (req: Request, res: Response): Promise<void> => {
   return updateCampaign(req, res);
 };
-// Replaced updateEnrollmentStatus
 
 export const enrollLeads = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
     const { contactIds } = req.body;
     
@@ -674,14 +721,26 @@ export const enrollLeads = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    const campaign = await prisma.campaign.findUnique({ where: { id: String(id) } });
-    if (!campaign) {
-      res.status(404).json({ error: 'Campaign not found' });
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
+    // Check that contactIds belong to user
+    const userContacts = await prisma.contact.findMany({
+      where: {
+        id: { in: contactIds },
+        userId: user.userId
+      },
+      select: { id: true }
+    });
+    const validContactIds = userContacts.map(c => c.id);
+
+    if (validContactIds.length === 0) {
+      res.status(400).json({ error: 'No valid contacts owned by current user found' });
       return;
     }
 
     const sequence = await prisma.sequence.findFirst({
-      where: { campaignId: String(id) },
+      where: { campaignId: campaign.id },
       orderBy: { createdAt: 'asc' }
     });
     
@@ -691,8 +750,8 @@ export const enrollLeads = async (req: Request, res: Response): Promise<void> =>
     }
 
     await prisma.enrollment.createMany({
-      data: contactIds.map(contactId => ({
-        campaignId: String(id),
+      data: validContactIds.map(contactId => ({
+        campaignId: campaign.id,
         sequenceId: sequence.id,
         contactId,
         status: 'active'
@@ -700,19 +759,24 @@ export const enrollLeads = async (req: Request, res: Response): Promise<void> =>
       skipDuplicates: true
     });
     
-    res.status(200).json({ success: true });
+    res.status(200).json({ success: true, count: validContactIds.length });
   } catch (error) {
     console.error('Error enrolling leads:', error);
     res.status(500).json({ error: 'Failed to enroll leads' });
   }
 };
+
 export const generateLeadDraft = async (req: Request, res: Response): Promise<void> => { res.status(200).json({}); };
+
 export const getCampaignLeads = async (req: Request, res: Response): Promise<void> => { 
   try {
     const { id } = req.params;
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
     const filter = String(req.query.filter || 'ALL');
     const { AnalyticsService } = await import('../services/analyticsService');
-    const contacts = await AnalyticsService.getCampaignContactEngagement(String(id), filter);
+    const contacts = await AnalyticsService.getCampaignContactEngagement(campaign.id, filter);
     res.status(200).json(contacts);
   } catch (error) {
     console.error('Error fetching enrollments:', error);
@@ -724,11 +788,14 @@ export const getCampaignLeads = async (req: Request, res: Response): Promise<voi
 export const updateEnrollmentStatus = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id, enrollmentId } = req.params;
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
     const { action, reason } = req.body; // action: 'pause', 'resume', 'stop'
 
     const enrollment = await prisma.enrollment.findUnique({ where: { id: String(enrollmentId) } });
-    if (!enrollment) {
-      res.status(404).json({ error: 'Enrollment not found' });
+    if (!enrollment || enrollment.campaignId !== campaign.id) {
+      res.status(404).json({ error: 'Enrollment not found in this campaign' });
       return;
     }
 
@@ -763,8 +830,11 @@ export const updateEnrollmentStatus = async (req: Request, res: Response): Promi
 export const getCampaignAuditLogs = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    const campaign = await OwnershipGuard.assertCampaign(req, res, String(id));
+    if (!campaign) return;
+
     const logs = await prisma.auditLog.findMany({
-      where: { campaignId: String(id) },
+      where: { campaignId: campaign.id },
       orderBy: { createdAt: 'desc' }
     });
     res.status(200).json(logs);
@@ -777,19 +847,20 @@ export const getCampaignAuditLogs = async (req: Request, res: Response): Promise
 // Phase 5: MVP Eligibility Preview
 export const getEligibilityPreview = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { listId, rules } = req.query;
-    const workspace = await getWorkspace();
     
     let eligibleContactIds: string[] = [];
     
     if (rules) {
-      // Dynamic rules parsing
       let parsedRules: any = {};
       try {
         parsedRules = JSON.parse(String(rules));
       } catch (e) {}
       
-      let whereClause: any = { workspaceId: workspace.id };
+      let whereClause: any = { userId: user.userId };
       if (parsedRules.city) whereClause.city = { contains: parsedRules.city, mode: 'insensitive' };
       if (parsedRules.jobTitle) whereClause.jobTitle = { contains: parsedRules.jobTitle, mode: 'insensitive' };
       if (parsedRules.industry) {
@@ -803,9 +874,14 @@ export const getEligibilityPreview = async (req: Request, res: Response): Promis
       
       eligibleContactIds = contacts.map(c => c.id);
     } else if (listId) {
-      // Static list
+      const list = await OwnershipGuard.assertList(req, res, String(listId));
+      if (!list) return;
+
       const members = await prisma.listMember.findMany({
-        where: { listId: String(listId) },
+        where: { 
+          listId: list.id,
+          contact: { userId: user.userId }
+        },
         select: { contactId: true }
       });
       eligibleContactIds = members.map(m => m.contactId);
@@ -830,20 +906,14 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
     const { id } = req.params;
     const campaignId = String(id);
 
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: campaignId }
-    });
-
-    if (!campaign) {
-      res.status(404).json({ error: 'Campaign not found' });
-      return;
-    }
+    const campaign = await OwnershipGuard.assertCampaign(req, res, campaignId);
+    if (!campaign) return;
 
     // Safely delete related records in proper topological order
     await prisma.$transaction(async (tx) => {
       // 1. Unlink emailMessageId in conversation messages
       const emailMessages = await tx.emailMessage.findMany({
-        where: { campaignId },
+        where: { campaignId: campaign.id },
         select: { id: true }
       });
       const emailMessageIds = emailMessages.map(m => m.id);
@@ -857,7 +927,7 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
 
       // 2. Unlink conversations attached to this campaign
       await tx.conversation.updateMany({
-        where: { campaignId },
+        where: { campaignId: campaign.id },
         data: { campaignId: null, sequenceId: null, enrollmentId: null }
       });
 
@@ -865,7 +935,7 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
       await tx.emailEvent.deleteMany({
         where: {
           OR: [
-            { campaignId },
+            { campaignId: campaign.id },
             ...(emailMessageIds.length > 0 ? [{ emailMessageId: { in: emailMessageIds } }] : [])
           ]
         }
@@ -873,22 +943,22 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
 
       // 4. Delete email messages
       await tx.emailMessage.deleteMany({
-        where: { campaignId }
+        where: { campaignId: campaign.id }
       });
 
       // 5. Delete conversions
       await tx.conversion.deleteMany({
-        where: { campaignId }
+        where: { campaignId: campaign.id }
       });
 
       // 6. Delete enrollments
       await tx.enrollment.deleteMany({
-        where: { campaignId }
+        where: { campaignId: campaign.id }
       });
 
       // 7. Delete sequence steps and sequences
       const sequences = await tx.sequence.findMany({
-        where: { campaignId },
+        where: { campaignId: campaign.id },
         select: { id: true }
       });
       const sequenceIds = sequences.map(s => s.id);
@@ -904,12 +974,12 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
 
       // 8. Delete audit logs
       await tx.auditLog.deleteMany({
-        where: { campaignId }
+        where: { campaignId: campaign.id }
       });
 
       // 9. Delete the campaign record itself
       await tx.campaign.delete({
-        where: { id: campaignId }
+        where: { id: campaign.id }
       });
     });
 

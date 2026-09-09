@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { OwnershipGuard } from '../utils/ownershipGuard';
 
 const prisma = new PrismaClient();
 
@@ -19,6 +20,9 @@ async function getWorkspace() {
 
 export const createContact = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { firstName, lastName, jobTitle, email, companyName, domain, industry, city, linkedinUrl, personalizedLine, personalizationTrigger, companySize, companyPhone } = req.body;
     const workspace = await getWorkspace();
 
@@ -46,10 +50,11 @@ export const createContact = async (req: Request, res: Response): Promise<void> 
       }
     }
 
-    // 2. Create Contact
+    // 2. Create Contact with authoritative userId
     const contact = await prisma.contact.create({
       data: {
         workspaceId: workspace.id,
+        userId: user.userId,
         organizationId: organization?.id || null,
         firstName,
         lastName,
@@ -82,23 +87,31 @@ export const createContact = async (req: Request, res: Response): Promise<void> 
 
 export const getContacts = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { search } = req.query;
     
-    let whereClause: any = {};
+    let whereClause: any = {
+      userId: user.userId
+    };
+
     if (search && typeof search === 'string') {
       const s = search;
-      whereClause = {
-        OR: [
-          { fullName: { contains: s, mode: 'insensitive' } },
-          { firstName: { contains: s, mode: 'insensitive' } },
-          { lastName: { contains: s, mode: 'insensitive' } },
-          { jobTitle: { contains: s, mode: 'insensitive' } },
-          { city: { contains: s, mode: 'insensitive' } },
-          { emails: { some: { email: { contains: s, mode: 'insensitive' } } } },
-          { organization: { name: { contains: s, mode: 'insensitive' } } },
-          { organization: { industry: { contains: s, mode: 'insensitive' } } },
-        ]
-      };
+      whereClause.AND = [
+        {
+          OR: [
+            { fullName: { contains: s, mode: 'insensitive' } },
+            { firstName: { contains: s, mode: 'insensitive' } },
+            { lastName: { contains: s, mode: 'insensitive' } },
+            { jobTitle: { contains: s, mode: 'insensitive' } },
+            { city: { contains: s, mode: 'insensitive' } },
+            { emails: { some: { email: { contains: s, mode: 'insensitive' } } } },
+            { organization: { name: { contains: s, mode: 'insensitive' } } },
+            { organization: { industry: { contains: s, mode: 'insensitive' } } },
+          ]
+        }
+      ];
     }
 
     const contacts = await prisma.contact.findMany({
@@ -151,8 +164,11 @@ export const getContacts = async (req: Request, res: Response): Promise<void> =>
 export const getContactById = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const contact = await prisma.contact.findUnique({
-      where: { id: String(id) },
+    const contact = await OwnershipGuard.assertContact(req, res, String(id));
+    if (!contact) return;
+
+    const fullContact = await prisma.contact.findUnique({
+      where: { id: contact.id },
       include: {
         organization: true,
         emails: true,
@@ -170,12 +186,7 @@ export const getContactById = async (req: Request, res: Response): Promise<void>
       }
     });
     
-    if (!contact) {
-      res.status(404).json({ error: 'Contact not found' });
-      return;
-    }
-    
-    res.status(200).json(contact);
+    res.status(200).json(fullContact);
   } catch (error) {
     console.error('Error fetching contact:', error);
     res.status(500).json({ error: 'Failed to fetch contact' });
@@ -184,6 +195,9 @@ export const getContactById = async (req: Request, res: Response): Promise<void>
 
 export const bulkImportContacts = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { contacts, listId, newListName } = req.body;
     const workspace = await getWorkspace();
     
@@ -194,6 +208,7 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
       const newList = await prisma.list.create({
         data: {
           workspaceId: workspace.id,
+          userId: user.userId,
           name: newListName,
           listType: 'static'
         }
@@ -254,9 +269,12 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
         orgId = organization.id;
       }
       
-      // 2. Check existing contact via Email
+      // 2. Check existing contact via Email strictly for this user
       const existingEmail = await prisma.contactEmail.findFirst({
-        where: { normalizedEmail: email },
+        where: { 
+          normalizedEmail: email,
+          contact: { userId: user.userId }
+        },
         include: { contact: true }
       });
       
@@ -285,10 +303,11 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
         }
         
       } else {
-        // Create new contact
+        // Create new contact scoped to user.userId
         const newContact = await prisma.contact.create({
           data: {
             workspaceId: workspace.id,
+            userId: user.userId,
             organizationId: orgId,
             firstName: row.firstName || null,
             lastName: row.lastName || null,
@@ -329,6 +348,8 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
 export const deleteContact = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = String(req.params.id);
+    const contact = await OwnershipGuard.assertContact(req, res, id);
+    if (!contact) return;
     
     // Explicitly delete related records since onDelete: Cascade is missing
     await prisma.$transaction([
@@ -351,6 +372,9 @@ export const deleteContact = async (req: Request, res: Response): Promise<void> 
 
 export const bulkDeleteContacts = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { ids } = req.body;
     
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -358,18 +382,30 @@ export const bulkDeleteContacts = async (req: Request, res: Response): Promise<v
       return;
     }
     
+    // Filter only contacts belonging to this user
+    const ownedContacts = await prisma.contact.findMany({
+      where: { id: { in: ids }, userId: user.userId },
+      select: { id: true }
+    });
+    const ownedIds = ownedContacts.map(c => c.id);
+
+    if (ownedIds.length === 0) {
+      res.status(200).json({ success: true, count: 0 });
+      return;
+    }
+
     await prisma.$transaction([
-      prisma.contactEmail.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.listMember.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.enrollment.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.emailMessage.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.emailEvent.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.conversationAction.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.conversation.deleteMany({ where: { contactId: { in: ids } } }),
-      prisma.contact.deleteMany({ where: { id: { in: ids } } })
+      prisma.contactEmail.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.listMember.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.enrollment.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.emailMessage.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.emailEvent.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.conversationAction.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.conversation.deleteMany({ where: { contactId: { in: ownedIds } } }),
+      prisma.contact.deleteMany({ where: { id: { in: ownedIds } } })
     ]);
     
-    res.status(200).json({ success: true, count: ids.length });
+    res.status(200).json({ success: true, count: ownedIds.length });
   } catch (error) {
     console.error('Error bulk deleting contacts:', error);
     res.status(500).json({ error: 'Failed to bulk delete contacts' });
@@ -379,6 +415,9 @@ export const bulkDeleteContacts = async (req: Request, res: Response): Promise<v
 export const updateContact = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = String(req.params.id);
+    const existing = await OwnershipGuard.assertContact(req, res, id);
+    if (!existing) return;
+
     const { firstName, lastName, jobTitle, city, companyName, industry, personalizedLine, personalizationTrigger, email, leadStatus } = req.body;
     
     // First, update the contact's main data
@@ -465,6 +504,9 @@ export const updateContact = async (req: Request, res: Response): Promise<void> 
 
 export const exportContacts = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { contactIds } = req.body;
     
     if (!Array.isArray(contactIds) || contactIds.length === 0) {
@@ -473,7 +515,10 @@ export const exportContacts = async (req: Request, res: Response): Promise<void>
     }
 
     const contacts = await prisma.contact.findMany({
-      where: { id: { in: contactIds } },
+      where: { 
+        id: { in: contactIds },
+        userId: user.userId
+      },
       include: {
         organization: true,
         emails: true,
