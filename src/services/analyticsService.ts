@@ -766,7 +766,9 @@ export class AnalyticsService {
     enrollmentId: string
   ): Promise<{
     contact: any;
+    enrollment?: any;
     engagement: ContactEngagementRow | null;
+    messages?: any[];
     events: ContactTimelineEvent[];
   }> {
     const enrollment = await prisma.enrollment.findFirst({
@@ -867,7 +869,16 @@ export class AnalyticsService {
 
     return {
       contact: enrollment.contact,
+      enrollment: {
+        id: enrollment.id,
+        currentStep: enrollment.currentStep,
+        status: enrollment.status,
+        stopReason: enrollment.stopReason,
+        nextSendAt: enrollment.nextSendAt,
+        lastSentAt: enrollment.lastSentAt
+      },
       engagement,
+      messages: enrollment.messages,
       events: timelineEvents
     };
   }
