@@ -469,7 +469,7 @@ export async function processEmailScheduler(options: {
             const previousEmail = await prisma.emailMessage.findFirst({
               where: {
                 enrollmentId: enrollment.id,
-                status: { in: ['sent', 'delivered'] }
+                status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied'] }
               },
               orderBy: { sentAt: 'desc' },
               include: {

@@ -46,7 +46,7 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
           select: { id: true, status: true }
         },
         messages: {
-          select: { id: true, status: true }
+          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true }
         },
         events: {
           select: { id: true, eventType: true }
@@ -58,11 +58,24 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
     const formatted = campaigns.map(c => {
       const enrolledCount = c.enrollments.length;
       const stepsCount = c.sequences.reduce((sum, seq) => sum + (seq.steps?.length || 0), 0);
-      const sentCount = c.messages.filter(m => m.status === 'sent' || m.status === 'delivered').length;
+      
+      const validStatuses = ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'];
+      const dispatchedMessages = c.messages.filter(m => 
+        validStatuses.includes(m.status) || (m.sentAt !== null && m.status !== 'failed' && m.status !== 'draft' && m.status !== 'pending')
+      );
+      const sentCount = dispatchedMessages.length;
+
+      const uniqueSentContacts = new Set<string>();
+      dispatchedMessages.forEach(m => {
+        if (m.enrollmentId) uniqueSentContacts.add(m.enrollmentId);
+        else if (m.toEmail) uniqueSentContacts.add(m.toEmail.toLowerCase());
+      });
+      const uniqueSentCount = uniqueSentContacts.size;
+
       const repliedEnrollments = c.enrollments.filter(e => e.status === 'replied').length;
       const repliedEvents = c.events.filter(e => e.eventType === 'replied' || e.eventType === 'email.replied').length;
       const repliesCount = Math.max(repliedEnrollments, repliedEvents);
-      const replyRate = sentCount > 0 ? Math.round((repliesCount / sentCount) * 100) : 0;
+      const replyRate = uniqueSentCount > 0 ? Math.min(100, Math.round((repliesCount / uniqueSentCount) * 100)) : 0;
       const senderEmail = c.senderMailboxes?.[0] || null;
       const replyToEmail = c.replyToEmail || senderEmail;
 
@@ -71,6 +84,8 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
         enrolledCount,
         stepsCount,
         sentCount,
+        totalSentMessages: sentCount,
+        uniqueSentCount,
         repliesCount,
         replyRate,
         senderEmail,
@@ -117,7 +132,13 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
     }
 
     const sentCount = await prisma.emailMessage.count({
-      where: { campaignId: campaign.id, status: { in: ['sent', 'delivered'] } }
+      where: { 
+        campaignId: campaign.id, 
+        OR: [
+          { status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] } },
+          { sentAt: { not: null }, status: { notIn: ['failed', 'draft', 'pending'] } }
+        ]
+      }
     });
 
     const repliedCount = await prisma.enrollment.count({
@@ -133,6 +154,7 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
       enrolledCount: campaign._count.enrollments,
       stepsCount,
       sentCount,
+      totalSentMessages: sentCount,
       repliesCount: repliedCount,
       senderEmail,
       replyToEmail
