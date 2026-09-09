@@ -5,13 +5,30 @@ import nodemailer from 'nodemailer';
 import { getCalendarBucketBounds, getDispatchedMessageCounts } from '../services/quotaService';
 
 const prisma = new PrismaClient();
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || process.env.MAILBOX_ENCRYPTION_KEY || '12345678901234567890123456789012'; // 32 bytes
+function getEncryptionKey(): Buffer {
+  const rawKey = process.env.ENCRYPTION_KEY || process.env.MAILBOX_ENCRYPTION_KEY;
+  if (!rawKey) {
+    if (process.env.NODE_ENV === 'production' || process.env.VERCEL) {
+      throw new Error('Server configuration error: ENCRYPTION_KEY is required in production');
+    }
+    return crypto.createHash('sha256').update('dev_ephemeral_key_not_for_production').digest();
+  }
+  const buf = Buffer.from(rawKey, 'utf8');
+  if (buf.length === 32) {
+    return buf;
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+    return Buffer.from(rawKey, 'hex');
+  }
+  return crypto.createHash('sha256').update(rawKey).digest();
+}
+
 const IV_LENGTH = 16;
 
 function encrypt(text: string): string {
   if (!text) return '';
   const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+  const cipher = crypto.createCipheriv('aes-256-cbc', getEncryptionKey(), iv);
   let encrypted = cipher.update(text);
   encrypted = Buffer.concat([encrypted, cipher.final()]);
   return iv.toString('hex') + ':' + encrypted.toString('hex');
@@ -23,7 +40,7 @@ export function decrypt(text: string): string {
     const textParts = text.split(':');
     const iv = Buffer.from(textParts.shift()!, 'hex');
     const encryptedText = Buffer.from(textParts.join(':'), 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    const decipher = crypto.createDecipheriv('aes-256-cbc', getEncryptionKey(), iv);
     let decrypted = decipher.update(encryptedText);
     decrypted = Buffer.concat([decrypted, decipher.final()]);
     return decrypted.toString();

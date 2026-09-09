@@ -237,7 +237,7 @@ export class PersonalizationService {
         status: 'FAILED',
         source: 'AI_RESEARCH',
         confidence: 'LOW',
-        reason: 'GEMINI_API_KEY is not configured in backend/.env'
+        reason: 'GEMINI_API_KEY is not configured on the server'
       };
     }
 

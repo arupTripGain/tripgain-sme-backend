@@ -1,8 +1,50 @@
 import { Request, Response } from 'express';
+import jwt from 'jsonwebtoken';
 import { processEmailScheduler } from '../services/schedulerService';
+import { JWT_SECRET } from '../middleware/authMiddleware';
+
+export function verifySchedulerAuth(
+  authHeader: string | undefined,
+  cronSecretHeader: string | undefined,
+  user: any,
+  expectedSecret: string,
+  jwtSecret?: string
+): { isAuthorized: boolean; status?: number; error?: string } {
+  const secret = (expectedSecret || '').trim();
+
+  if (!secret) {
+    return { isAuthorized: false, status: 500, error: 'Server configuration error: CRON_SECRET not set' };
+  }
+
+  const rawAuth = (authHeader || '').trim();
+  const rawCronSecret = (cronSecretHeader || '').trim();
+
+  let bearerToken = '';
+  if (rawAuth.toLowerCase().startsWith('bearer ')) {
+    bearerToken = rawAuth.slice(7).trim();
+  }
+
+  const isCronAuthorized = secret.length > 0 && (
+    bearerToken === secret || 
+    rawCronSecret === secret
+  );
+
+  let isUserAuthorized = !!user;
+  if (!isCronAuthorized && !isUserAuthorized && bearerToken && jwtSecret) {
+    try {
+      const decoded = jwt.verify(bearerToken, jwtSecret);
+      if (decoded) isUserAuthorized = true;
+    } catch (_) {}
+  }
+
+  if (!isCronAuthorized && !isUserAuthorized) {
+    return { isAuthorized: false, status: 401, error: 'Unauthorized: missing or invalid cron secret' };
+  }
+
+  return { isAuthorized: true };
+}
 
 export const runTick = async (req: Request, res: Response): Promise<void> => {
-  // CRON_SECRET Authentication / Protection
   const expectedSecret = (process.env.CRON_SECRET || '').trim();
 
   // If in production and CRON_SECRET is missing, fail safely
@@ -12,23 +54,16 @@ export const runTick = async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const authHeader = (req.headers.authorization || '').trim();
-  const cronSecretHeader = (req.headers['x-cron-secret'] as string || '').trim();
-
-  // Extract Bearer token case-insensitively
-  let bearerToken = '';
-  if (authHeader.toLowerCase().startsWith('bearer ')) {
-    bearerToken = authHeader.slice(7).trim();
-  }
-
-  const isCronAuthorized = expectedSecret.length > 0 && (
-    bearerToken === expectedSecret || 
-    cronSecretHeader === expectedSecret
+  const authResult = verifySchedulerAuth(
+    req.headers.authorization,
+    req.headers['x-cron-secret'] as string | undefined,
+    req.user,
+    expectedSecret,
+    JWT_SECRET
   );
-  const isUserAuthorized = !!req.user; // Authenticated admin/user via JWT/session
 
-  if (!isCronAuthorized && !isUserAuthorized) {
-    res.status(401).json({ success: false, error: 'Unauthorized: missing or invalid cron secret' });
+  if (!authResult.isAuthorized) {
+    res.status(authResult.status || 401).json({ success: false, error: authResult.error });
     return;
   }
 

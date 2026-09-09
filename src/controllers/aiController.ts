@@ -114,7 +114,7 @@ export const generateTemplate = async (req: Request, res: Response): Promise<voi
     const rawKey = getGeminiKey();
 
     if (!rawKey) {
-      res.status(500).json({ error: 'GEMINI_API_KEY is missing in backend/.env — please add your Gemini API key.' });
+      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
       return;
     }
 

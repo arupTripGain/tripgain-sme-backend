@@ -4,7 +4,7 @@ import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
-export const JWT_SECRET = process.env.JWT_SECRET || 'tripgain_kinetic_super_secret_jwt_key_2026';
+export const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' || process.env.VERCEL ? '' : 'dev_local_jwt_secret_only');
 
 export interface AuthUser {
   userId: string;
@@ -27,6 +27,10 @@ export const authenticateToken = async (req: Request, res: Response, next: NextF
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
 
   if (token) {
+    if (!JWT_SECRET) {
+      res.status(500).json({ error: 'Server configuration error: JWT_SECRET not set' });
+      return;
+    }
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as AuthUser;
       req.user = decoded;
