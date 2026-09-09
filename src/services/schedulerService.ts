@@ -392,25 +392,29 @@ export async function processEmailScheduler(options: {
         }
 
       for (const enrollment of dueEnrollments) {
-        // 1. Lock Enrollment (clearing expired locks if any)
-        const locked = await prisma.enrollment.updateMany({
-          where: { 
-            id: enrollment.id, 
-            OR: [
-              { lockedAt: null },
-              { lockExpiresAt: { lte: new Date() } }
-            ]
-          },
-          data: {
-            lockedAt: new Date(),
-            lockedBy: workerId,
-            lockExpiresAt: new Date(Date.now() + 10 * 60 * 1000)
-          }
-        });
-
-        if (locked.count === 0) continue;
-
         try {
+          // 1. Lock Enrollment (clearing expired locks if any, or confirming worker reservation from Step F)
+          const locked = await prisma.enrollment.updateMany({
+            where: { 
+              id: enrollment.id, 
+              OR: [
+                { lockedAt: null },
+                { lockExpiresAt: { lte: new Date() } },
+                { lockedBy: workerId }
+              ]
+            },
+            data: {
+              lockedAt: new Date(),
+              lockedBy: workerId,
+              lockExpiresAt: new Date(Date.now() + 10 * 60 * 1000)
+            }
+          });
+
+          if (locked.count === 0) {
+            console.log(`[Scheduler] Enrollment ${enrollment.id} locked by another worker, skipping.`);
+            continue;
+          }
+
           // 2. Safety Checks
           const stopCheck = await shouldStopBeforeSend(enrollment.id);
           if (stopCheck.stop) {
