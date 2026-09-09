@@ -453,8 +453,63 @@ export async function processEmailScheduler(options: {
           });
 
           const primaryEmail = contact?.emails?.find(e => e.isPrimary)?.email || contact?.emails?.[0]?.email || 'test@example.com';
-          const templateSubject = step.subjectTemplate || 'Outreach from TripGain';
           const rawBody = step.bodyTemplate || step.bodyHtmlTemplate || '';
+
+          const isSubjectEmpty = !step.subjectTemplate || step.subjectTemplate.trim().length === 0;
+          const isFollowUp = (step.stepNumber || enrollment.currentStep) > 1;
+
+          let isReplyInThread = false;
+          let parentInternetMessageId: string | null = null;
+          let parentReferences: string | null = null;
+          let parentProviderThreadId: string | null = null;
+          let threadSubject: string = '';
+
+          if (isFollowUp && isSubjectEmpty) {
+            // CASE B: Follow-up step with empty subject -> reply in thread
+            const previousEmail = await prisma.emailMessage.findFirst({
+              where: {
+                enrollmentId: enrollment.id,
+                status: { in: ['sent', 'delivered'] }
+              },
+              orderBy: { sentAt: 'desc' },
+              include: {
+                conversationMessages: {
+                  where: { direction: 'OUTBOUND' },
+                  orderBy: { sentAt: 'desc' },
+                  take: 1
+                }
+              }
+            });
+
+            if (previousEmail) {
+              const prevConvMsg = previousEmail.conversationMessages?.[0];
+              const prevMsgId = prevConvMsg?.internetMessageId || previousEmail.providerMessageId;
+
+              if (prevMsgId) {
+                isReplyInThread = true;
+                parentInternetMessageId = prevMsgId.startsWith('<') && prevMsgId.endsWith('>') ? prevMsgId : `<${prevMsgId}>`;
+
+                const prevMeta = (prevConvMsg?.metadata as any) || {};
+                const existingReferences = typeof prevMeta.references === 'string' ? prevMeta.references.trim() : '';
+                parentReferences = existingReferences 
+                  ? `${existingReferences} ${parentInternetMessageId}` 
+                  : parentInternetMessageId;
+
+                const conv = await prisma.conversation.findFirst({
+                  where: {
+                    OR: [
+                      { enrollmentId: enrollment.id },
+                      { contactId: enrollment.contactId, campaignId: campaign.id }
+                    ]
+                  }
+                });
+                parentProviderThreadId = conv?.providerThreadId || (prevMeta.providerThreadId as string) || null;
+
+                // Thread subject: MUST be the previous outbound email's exact subject, NO fallback generation
+                threadSubject = previousEmail.subject || '';
+              }
+            }
+          }
 
           const templateData = {
             firstName: contact?.firstName || 'there',
@@ -471,9 +526,6 @@ export async function processEmailScheduler(options: {
             senderName: mailbox.displayName || 'Arup Nirala',
             senderCompany: 'TripGain'
           };
-
-          let renderedSubject = templateSubject;
-          let renderedBody = rawBody;
 
           // Helper to sanitize template before Handlebars compile
           const sanitizeTemplate = (tmpl: string): string => {
@@ -507,16 +559,32 @@ export async function processEmailScheduler(options: {
             return cleaned;
           };
 
-          try {
-            const cleanSubject = sanitizeTemplate(templateSubject);
-            const hSubject = Handlebars.compile(cleanSubject, { noEscape: true });
-            renderedSubject = hSubject(templateData);
+          let renderedSubject = '';
+          if (!isSubjectEmpty) {
+            // CASE A: Step subject contains text -> Render and use that subject
+            try {
+              const cleanSubject = sanitizeTemplate(step.subjectTemplate!);
+              const hSubject = Handlebars.compile(cleanSubject, { noEscape: true });
+              renderedSubject = hSubject(templateData);
+            } catch (renderErr) {
+              console.error('[Scheduler] Handlebars render error in subject:', renderErr);
+              renderedSubject = step.subjectTemplate || '';
+            }
+          } else if (isFollowUp && isReplyInThread) {
+            // CASE B: Follow-up step with empty subject -> reuse previous message's subject in thread, no fallback generated
+            renderedSubject = threadSubject;
+          } else {
+            // CASE C: Step 1 with empty subject -> genuinely empty, no fallback generated
+            renderedSubject = '';
+          }
 
+          let renderedBody = rawBody;
+          try {
             const cleanBody = sanitizeTemplate(rawBody);
             const hBody = Handlebars.compile(cleanBody, { noEscape: true });
             renderedBody = hBody(templateData);
           } catch (renderErr) {
-            console.error('[Scheduler] Handlebars render error in scheduler:', renderErr);
+            console.error('[Scheduler] Handlebars render error in body:', renderErr);
           }
 
           // Clean phantom empty paragraphs from Handlebars blocks
@@ -642,14 +710,26 @@ export async function processEmailScheduler(options: {
               </html>
             `;
 
-            const sendInfo = await transporter.sendMail({
+            const mailOptions: any = {
               from: `"${mailbox.displayName || mailbox.email}" <${mailbox.email}>`,
               to: primaryEmail,
               subject: renderedSubject,
               text: plainText,
               html: emailHtml,
               messageId: internetMessageId
-            });
+            };
+
+            if (isReplyInThread && parentInternetMessageId) {
+              mailOptions.inReplyTo = parentInternetMessageId;
+              mailOptions.references = parentReferences || parentInternetMessageId;
+              mailOptions.headers = {
+                'In-Reply-To': parentInternetMessageId,
+                'References': parentReferences || parentInternetMessageId,
+                ...(parentProviderThreadId ? { 'X-GM-THRID': parentProviderThreadId } : {})
+              };
+            }
+
+            const sendInfo = await transporter.sendMail(mailOptions);
 
             if (sendInfo && sendInfo.messageId) {
               internetMessageId = sendInfo.messageId;
@@ -660,7 +740,12 @@ export async function processEmailScheduler(options: {
           // 8. Register Outbound in Unibox thread so prospective replies bind to this thread
           try {
             let conv = await prisma.conversation.findFirst({
-              where: { contactId: enrollment.contactId }
+              where: {
+                OR: [
+                  { enrollmentId: enrollment.id },
+                  { contactId: enrollment.contactId, campaignId: campaign.id }
+                ]
+              }
             });
 
             const cleanText = renderedBody.replace(/<[^>]*>?/gm, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
@@ -679,6 +764,18 @@ export async function processEmailScheduler(options: {
                   latestMessageAt: new Date(),
                   latestMessagePreview: cleanText.slice(0, 100) + (cleanText.length > 100 ? '...' : ''),
                   latestMessageDirection: 'OUTBOUND',
+                  lastOutboundAt: new Date(),
+                  internetMessageThreadId: parentInternetMessageId || internetMessageId,
+                  providerThreadId: parentProviderThreadId || null
+                }
+              });
+            } else {
+              await prisma.conversation.update({
+                where: { id: conv.id },
+                data: {
+                  latestMessageAt: new Date(),
+                  latestMessagePreview: cleanText.slice(0, 100) + (cleanText.length > 100 ? '...' : ''),
+                  latestMessageDirection: 'OUTBOUND',
                   lastOutboundAt: new Date()
                 }
               });
@@ -693,6 +790,7 @@ export async function processEmailScheduler(options: {
                 messageType: 'EMAIL',
                 internetMessageId,
                 providerMessageId,
+                inReplyToMessageId: parentInternetMessageId || null,
                 senderName: mailbox.displayName || mailbox.email,
                 senderEmail: mailbox.email,
                 recipientEmails: [primaryEmail],
@@ -700,7 +798,12 @@ export async function processEmailScheduler(options: {
                 bodyText: cleanBodyText,
                 bodyHtml: renderedBody,
                 isRead: true,
-                sentAt: new Date()
+                sentAt: new Date(),
+                metadata: {
+                  inReplyTo: parentInternetMessageId || null,
+                  references: parentReferences || null,
+                  providerThreadId: parentProviderThreadId || null
+                }
               }
             });
           } catch (convErr) {
