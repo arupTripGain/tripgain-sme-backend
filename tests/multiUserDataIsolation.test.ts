@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import assert from 'assert';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
@@ -118,6 +119,13 @@ async function runTests() {
 
   // 4. Test Contacts Isolation
   console.log('\n--- 4. Testing Contacts Isolation ---');
+  // Clean up any residual test contact for Sarah to guarantee clean baseline
+  const existingSarahContacts = await prisma.contact.findMany({ where: { userId: SARAH_USER_ID }, select: { id: true } });
+  if (existingSarahContacts.length > 0) {
+    const sIds = existingSarahContacts.map(c => c.id);
+    await prisma.contactEmail.deleteMany({ where: { contactId: { in: sIds } } });
+    await prisma.contact.deleteMany({ where: { id: { in: sIds } } });
+  }
   let arupContactId: string = '';
   {
     // Arup gets contacts -> should see 14 contacts

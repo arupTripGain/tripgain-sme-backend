@@ -30,6 +30,8 @@ model User {
   contacts        Contact[]
   lists           List[]
   suppressionEntries SuppressionList[]
+  aiKey           UserAIKey?
+  aiUsages        AIUsage[]
 }
 
 model Workspace {
@@ -698,4 +700,37 @@ model PersonalizationJob {
   updatedAt   DateTime  @updatedAt
 
   @@index([userId])
+}
+
+model UserAIKey {
+  id              String    @id @default(uuid())
+  userId          String    @unique
+  provider        String    @default("GEMINI")
+  encryptedApiKey String
+  keyLast4        String
+  isActive        Boolean   @default(true)
+  lastUsedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AIUsage {
+  id           String    @id @default(uuid())
+  userId       String
+  provider     String    // GEMINI_USER, GEMINI_PLATFORM
+  feature      String    // PERSONALIZATION, EMAIL_GENERATION
+  status       String    // SUCCESS, FAILED
+  requestedAt  DateTime  @default(now())
+  completedAt  DateTime?
+  inputTokens  Int?
+  outputTokens Int?
+  totalTokens  Int?
+  errorCode    String?
+
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, requestedAt])
+  @@index([provider, requestedAt])
 }

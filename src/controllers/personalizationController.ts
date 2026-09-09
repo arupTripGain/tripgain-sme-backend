@@ -40,10 +40,23 @@ export const personalizeContact = async (req: Request, res: Response): Promise<v
       return;
     }
 
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const contact = await OwnershipGuard.assertContact(req, res, id);
     if (!contact) return;
 
-    const result = await PersonalizationService.generateForContact(contact.id, !!force);
+    const result = await PersonalizationService.generateForContact(contact.id, !!force, user.userId);
+    if (!result.success && result.code) {
+      if (result.code === 'AI_PROVIDER_NOT_CONFIGURED') {
+        res.status(400).json({ error: result.reason, code: result.code });
+        return;
+      }
+      if (result.code === 'AI_USAGE_LIMIT_REACHED') {
+        res.status(429).json({ error: result.reason, code: result.code });
+        return;
+      }
+    }
     res.status(200).json(result);
   } catch (error: any) {
     console.error('[PersonalizationController] Error in personalizeContact:', error);
@@ -118,6 +131,7 @@ export const startBulkPersonalization = async (req: Request, res: Response): Pro
 
     const job = await PersonalizationQueue.startBulkJob({
       workspaceId: workspace.id,
+      userId: user.userId,
       contactIds: validContactIds,
       listId,
       onlyMissing: !!onlyMissing,

@@ -1,23 +1,6 @@
 import { Request, Response } from 'express';
-import { GoogleGenAI } from '@google/genai';
-import * as fs from 'fs';
-import * as path from 'path';
-
-// Fallback: read GEMINI_API_KEY directly from .env if process.env is missing it
-// (needed because dotenvx sometimes skips injection)
-function getGeminiKey(): string {
-  let key = (process.env.GEMINI_API_KEY || '').replace(/^\"|\"$/g, '').trim();
-  if (!key) {
-    try {
-      const envPath = path.resolve(__dirname, '../../.env');
-      const envContent = fs.readFileSync(envPath, 'utf-8');
-      const match = envContent.match(/^GEMINI_API_KEY=["']?([^"'\r\n]+)["']?/m);
-      if (match && match[1]) key = match[1].trim();
-    } catch (_) {}
-  }
-  return key;
-}
-
+import { OwnershipGuard } from '../utils/ownershipGuard';
+import { AIProviderService, AIProviderError } from '../services/aiProviderService';
 
 const SYSTEM_PROMPT = `You are an AI email template generator for TripGain SME Outreach.
 
@@ -103,23 +86,15 @@ function autoBalanceHandlebars(template: string): string {
 
 export const generateTemplate = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { instruction, context } = req.body;
 
     if (!instruction) {
       res.status(400).json({ error: 'Instruction is required.' });
       return;
     }
-
-    // Strip any stray surrounding quotes from the env var (in case .env was saved with quotes)
-    const rawKey = getGeminiKey();
-
-    if (!rawKey) {
-      res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
-      return;
-    }
-
-    // Initialize lazily so a bad key doesn't crash the server at startup
-    const ai = new GoogleGenAI({ apiKey: rawKey });
 
     const userPrompt = `
 Instruction: ${instruction}
@@ -128,53 +103,33 @@ Campaign Context:
 ${context || 'Company: TripGain\nProduct: Business Travel & Expense Management\nTarget: SME decision makers\nGoal: Start a conversation\nTone: Professional, concise\nCTA: Quick conversation'}
     `;
 
-    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    const aiResult = await AIProviderService.generateText({
+      userId: user.userId,
+      feature: 'EMAIL_GENERATION',
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt,
+      temperature: 0.7,
+      maxOutputTokens: 2048
+    });
 
-    let response: any;
-    const models = [
-      'gemini-flash-lite-latest',
-      'gemini-flash-latest',
-      'gemini-3.5-flash-lite',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash',
-    ];
-    let lastError: any;
+    const generatedText = aiResult.text || '';
 
-    for (const model of models) {
-      try {
-        response = await ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.7,
-            maxOutputTokens: 2048,
-          }
-        });
-        if (response?.text) {
-          break; // success — exit loop immediately
-        }
-      } catch (err: any) {
-        lastError = err;
-        const msg = err?.message || '';
-        console.warn(`Model ${model} failed (${err?.status || err?.code || 'error'}): ${msg.slice(0, 120)}. Trying fallback model...`);
-      }
-    }
-
-    if (!response) {
-      throw lastError || new Error('All models unavailable');
-    }
-
-    const generatedText = response.text || '';
-
-    // Some cleanup in case the AI added markdown blocks like ```html or ```text
+    // Cleanup code fence blocks if any
     let cleanedText = generatedText.replace(/^```[a-z]*\n/gi, '').replace(/```$/g, '').trim();
 
     // Auto balance any unclosed Handlebars tags
     cleanedText = autoBalanceHandlebars(cleanedText);
 
-    res.status(200).json({ template: cleanedText });
+    res.status(200).json({
+      template: cleanedText,
+      provider: aiResult.provider,
+      keyLast4: aiResult.keyLast4
+    });
   } catch (error: any) {
+    if (error instanceof AIProviderError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
     const msg = error?.message || String(error);
     console.error('Error generating template:', msg);
     res.status(500).json({ error: 'Failed to generate template', detail: msg });

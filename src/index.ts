@@ -128,9 +128,15 @@ import { handleRedirect, handleOpenTracking } from './controllers/trackingContro
 import { simulateEvent, handleProviderWebhook } from './controllers/webhookController';
 import { getConversations, getConversationById, replyToConversation, performConversationAction, simulateLeadReply, syncReplies } from './controllers/uniboxController';
 import aiRoutes from './routes/aiRoutes';
+import { getAISettings, saveGeminiKey, removeGeminiKey } from './controllers/settingsAiController';
 
 // AI Routes
 app.use('/api/ai', authenticateToken, aiRoutes);
+
+// Settings AI (BYOK Gemini)
+app.get('/api/settings/ai', authenticateToken, getAISettings);
+app.post('/api/settings/ai/gemini', authenticateToken, saveGeminiKey);
+app.delete('/api/settings/ai/gemini', authenticateToken, removeGeminiKey);
 
 // Phase 6 Engine & Tracking
 app.get('/api/scheduler/tick', runTick);

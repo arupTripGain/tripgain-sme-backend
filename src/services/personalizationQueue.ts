@@ -11,6 +11,7 @@ export class PersonalizationQueue {
    */
   static async startBulkJob(params: {
     workspaceId: string;
+    userId?: string;
     contactIds?: string[];
     listId?: string;
     onlyMissing?: boolean;
@@ -27,9 +28,11 @@ export class PersonalizationQueue {
       });
       targetIds = members.map(m => m.contactId);
     } else {
-      // Default: all contacts in workspace
+      // Default: all contacts in workspace scoped to user if provided
+      const contactWhere: any = { workspaceId: params.workspaceId };
+      if (params.userId) contactWhere.userId = params.userId;
       const allContacts = await prisma.contact.findMany({
-        where: { workspaceId: params.workspaceId },
+        where: contactWhere,
         select: { id: true }
       });
       targetIds = allContacts.map(c => c.id);
@@ -55,6 +58,7 @@ export class PersonalizationQueue {
     const job = await prisma.personalizationJob.create({
       data: {
         workspaceId: params.workspaceId,
+        userId: params.userId || null,
         status: targetIds.length === 0 ? 'COMPLETED' : 'PROCESSING',
         total: targetIds.length,
         processed: 0,
@@ -67,7 +71,7 @@ export class PersonalizationQueue {
     if (targetIds.length > 0) {
       // Launch background worker without blocking
       this.activeJobs.add(job.id);
-      this.processJob(job.id, targetIds, !!params.force).catch(err => {
+      this.processJob(job.id, targetIds, !!params.force, params.userId).catch(err => {
         console.error(`[PersonalizationQueue] Error in job ${job.id}:`, err);
       });
     }
@@ -82,26 +86,36 @@ export class PersonalizationQueue {
   /**
    * Worker executing batch items with controlled concurrency.
    */
-  private static async processJob(jobId: string, contactIds: string[], force: boolean): Promise<void> {
+  private static async processJob(
+    jobId: string,
+    contactIds: string[],
+    force: boolean,
+    userId?: string
+  ): Promise<void> {
     const BATCH_SIZE = 2; // Process 2 leads at a time to stay within rate limits
     let processed = 0;
     let successful = 0;
     let failed = 0;
+    let abortJob = false;
 
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     try {
       for (let i = 0; i < contactIds.length; i += BATCH_SIZE) {
+        if (abortJob) break;
         const batch = contactIds.slice(i, i + BATCH_SIZE);
 
         await Promise.all(
           batch.map(async (contactId) => {
             try {
-              const res = await PersonalizationService.generateForContact(contactId, force);
+              const res = await PersonalizationService.generateForContact(contactId, force, userId);
               if (res.success && res.personalization) {
                 successful++;
               } else {
                 failed++;
+                if (res.code === 'AI_PROVIDER_NOT_CONFIGURED' || res.code === 'AI_USAGE_LIMIT_REACHED') {
+                  abortJob = true;
+                }
               }
             } catch (err) {
               console.error(`[PersonalizationQueue] Failed contact ${contactId}:`, err);
@@ -123,17 +137,22 @@ export class PersonalizationQueue {
           }
         });
 
+        if (abortJob) {
+          console.warn(`[PersonalizationQueue] Aborting job ${jobId} due to unconfigured AI provider or quota limit`);
+          break;
+        }
+
         // Small delay between batches to respect rate limits
         if (i + BATCH_SIZE < contactIds.length) {
           await sleep(300);
         }
       }
 
-      // Mark completed
+      // Mark completed or failed based on abort
       await prisma.personalizationJob.update({
         where: { id: jobId },
         data: {
-          status: 'COMPLETED',
+          status: abortJob ? 'FAILED' : 'COMPLETED',
           processed,
           successful,
           failed,

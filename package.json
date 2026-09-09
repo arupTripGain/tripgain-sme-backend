@@ -14,7 +14,7 @@
     "build": "prisma generate && tsc",
     "start": "node dist/src/index.js",
     "dev": "nodemon src/index.ts",
-    "test": "ts-node tests/rotationService.test.ts && ts-node tests/schedulerAuth.test.ts && ts-node tests/schedulerOptimization.test.ts && ts-node tests/schedulerConcurrencyAndLocking.test.ts && ts-node tests/sequenceSubjectAndThreading.test.ts && ts-node tests/outreachAnalytics.test.ts && ts-node tests/multiUserDataIsolation.test.ts",
+    "test": "ts-node tests/rotationService.test.ts && ts-node tests/schedulerAuth.test.ts && ts-node tests/schedulerOptimization.test.ts && ts-node tests/schedulerConcurrencyAndLocking.test.ts && ts-node tests/sequenceSubjectAndThreading.test.ts && ts-node tests/outreachAnalytics.test.ts && ts-node tests/multiUserDataIsolation.test.ts && ts-node tests/byokGeminiAi.test.ts",
     "postinstall": "prisma generate"
   },
   "keywords": [],

@@ -1,25 +1,8 @@
 import { PrismaClient } from '@prisma/client';
-import { GoogleGenAI } from '@google/genai';
-import * as fs from 'fs';
-import * as path from 'path';
 import { ResearchService } from './researchService';
+import { AIProviderService } from './aiProviderService';
 
 const prisma = new PrismaClient();
-
-function getGeminiKey(): string {
-  let key = (process.env.GEMINI_API_KEY || '').replace(/^\"|\"$/g, '').trim();
-  if (!key) {
-    try {
-      const envPath = path.resolve(__dirname, '../../.env');
-      if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf-8');
-        const match = envContent.match(/^GEMINI_API_KEY=["']?([^"'\r\n]+)["']?/m);
-        if (match && match[1]) key = match[1].trim();
-      }
-    } catch (_) {}
-  }
-  return key;
-}
 
 export interface GenerationResult {
   success: boolean;
@@ -29,6 +12,8 @@ export interface GenerationResult {
   confidence: 'HIGH' | 'MEDIUM' | 'LOW';
   evidence?: any | undefined;
   reason?: string | undefined;
+  code?: string | undefined;
+  provider?: string | undefined;
 }
 
 export class PersonalizationValidator {
@@ -132,7 +117,7 @@ export class PersonalizationService {
    * Generates personalization for a single contact by contactId.
    * If force = false and existing source is 'MANUAL', preserves manual edit.
    */
-  static async generateForContact(contactId: string, force = false): Promise<GenerationResult> {
+  static async generateForContact(contactId: string, force = false, userId?: string): Promise<GenerationResult> {
     const contact = await prisma.contact.findUnique({
       where: { id: contactId },
       include: { organization: true, emails: true }
@@ -168,7 +153,7 @@ export class PersonalizationService {
       data: { personalizationStatus: 'GENERATING' }
     });
 
-    const result = await this.executeGeneration(contact);
+    const result = await this.executeGeneration(contact, userId);
 
     // Save result to contact
     const updateData: any = {
@@ -194,7 +179,7 @@ export class PersonalizationService {
   /**
    * Core logic: gathers research, calls LLM, validates, returns structured result.
    */
-  private static async executeGeneration(contact: any): Promise<GenerationResult> {
+  private static async executeGeneration(contact: any, userId?: string): Promise<GenerationResult> {
     const company = contact.organization;
     const companyName = company?.name || '';
     const website = company?.domain || company?.websiteUrl || '';
@@ -229,19 +214,7 @@ export class PersonalizationService {
       fullName: contact.fullName
     });
 
-    const rawKey = getGeminiKey();
-    if (!rawKey) {
-      return {
-        success: false,
-        personalization: null,
-        status: 'FAILED',
-        source: 'AI_RESEARCH',
-        confidence: 'LOW',
-        reason: 'GEMINI_API_KEY is not configured on the server'
-      };
-    }
-
-    const ai = new GoogleGenAI({ apiKey: rawKey });
+    const effectiveUserId = userId || (contact as any).userId || '';
 
     const systemPrompt = `You are generating personalization for a B2B cold email on behalf of TripGain.
 
@@ -293,49 +266,37 @@ Value proposition: Booking, approvals, travel management and automated expense r
 Target: SMEs with business travel requirements.
 `;
 
-    const models = [
-      'gemini-flash-lite-latest',
-      'gemini-flash-latest',
-      'gemini-3.5-flash-lite',
-      'gemini-3.5-flash',
-      'gemini-2.5-flash'
-    ];
-
-    let rawGeneratedText = '';
-    let lastError: any;
-
-    for (const model of models) {
-      try {
-        const resp: any = await ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            temperature: 0.4,
-            maxOutputTokens: 250,
-          }
-        });
-        if (resp?.text) {
-          rawGeneratedText = resp.text.trim();
-          break;
-        }
-      } catch (err: any) {
-        lastError = err;
-        console.warn(`[PersonalizationService] Model ${model} error:`, err?.message?.slice(0, 100));
-      }
-    }
-
-    if (!rawGeneratedText) {
-      console.error('[PersonalizationService] Failed to generate personalization:', lastError?.message);
+    let aiResult;
+    try {
+      aiResult = await AIProviderService.generateText({
+        userId: effectiveUserId,
+        feature: 'PERSONALIZATION',
+        systemPrompt,
+        userPrompt,
+        models: [
+          'gemini-flash-lite-latest',
+          'gemini-flash-latest',
+          'gemini-3.5-flash-lite',
+          'gemini-3.5-flash',
+          'gemini-2.5-flash'
+        ],
+        temperature: 0.4,
+        maxOutputTokens: 250
+      });
+    } catch (err: any) {
+      console.error('[PersonalizationService] Failed to generate personalization:', err?.message);
       return {
         success: false,
         personalization: null,
         status: 'FAILED',
         source: 'AI_RESEARCH',
         confidence: 'LOW',
-        reason: lastError?.message || 'AI generation failed'
+        reason: err?.message || 'AI generation failed',
+        code: err?.code || 'AI_GENERATION_FAILED'
       };
     }
+
+    const rawGeneratedText = aiResult.text.trim();
 
     // Clean markdown code fence if model returned it
     let cleaned = rawGeneratedText.replace(/^```[a-z]*\n?/gi, '').replace(/```$/g, '').trim();
