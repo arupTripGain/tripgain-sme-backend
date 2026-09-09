@@ -43,7 +43,14 @@ import { personalizeContact, editPersonalization, startBulkPersonalization, getB
 import { createOrganization, getOrganizations } from './controllers/organizationController';
 import { createList, getLists, getListById, deleteList, addMembersToList, removeMembersFromList, updateList, duplicateList } from './controllers/listController';
 import { getCampaigns, getCampaignById, composeCampaign, activateCampaign, pauseCampaign, duplicateCampaign, getCampaignLeads, updateCampaign, updateCampaignSteps, generateLeadDraft, updateEnrollmentStatus, enrollLeads, getCampaignAuditLogs, getEligibilityPreview, deleteCampaign } from './controllers/campaignController';
-import { getCampaignAnalytics } from './controllers/campaignAnalyticsController';
+import { 
+  getCampaignAnalytics, 
+  getCampaignStepAnalytics, 
+  getCampaignLinkAnalytics, 
+  getCampaignContactAnalytics, 
+  getContactTimeline, 
+  exportCampaignAnalytics 
+} from './controllers/campaignAnalyticsController';
 import { getGlobalAnalytics } from './controllers/analyticsController';
 import { getDashboardStats } from './controllers/dashboardController';
 import { runTick } from './controllers/schedulerController';
@@ -106,6 +113,11 @@ app.get('/api/campaigns/:id/audit-logs', getCampaignAuditLogs);
 app.get('/api/analytics', getGlobalAnalytics);
 app.get('/api/dashboard', getDashboardStats);
 app.get('/api/campaigns/:id/analytics', getCampaignAnalytics);
+app.get('/api/campaigns/:id/analytics/steps', getCampaignStepAnalytics);
+app.get('/api/campaigns/:id/analytics/links', getCampaignLinkAnalytics);
+app.get('/api/campaigns/:id/analytics/contacts', getCampaignContactAnalytics);
+app.get('/api/campaigns/:id/analytics/contacts/:enrollmentId/timeline', getContactTimeline);
+app.get('/api/campaigns/:id/analytics/export', exportCampaignAnalytics);
 app.get('/api/campaigns/:id/leads', getCampaignLeads);
 app.put('/api/campaigns/:id', updateCampaign);
 app.put('/api/campaigns/:id/steps', updateCampaignSteps);

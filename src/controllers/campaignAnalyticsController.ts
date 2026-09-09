@@ -1,102 +1,105 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import { AnalyticsService } from '../services/analyticsService';
 
 export const getCampaignAnalytics = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const campaignId = String(id);
+    const { days, startDate, endDate } = req.query;
 
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: campaignId },
-      include: {
-        enrollments: true,
-        messages: true,
-        events: true,
-        conversions: true,
-      }
-    });
+    const parsedDays = days ? parseInt(String(days), 10) : 7;
+    const parsedStart = startDate ? new Date(String(startDate)) : undefined;
+    const parsedEnd = endDate ? new Date(String(endDate)) : undefined;
 
-    if (!campaign) {
-      res.status(404).json({ error: 'Campaign not found' });
-      return;
-    }
+    const overviewOptions: { startDate?: Date; endDate?: Date } = {};
+    if (parsedStart && !isNaN(parsedStart.getTime())) overviewOptions.startDate = parsedStart;
+    if (parsedEnd && !isNaN(parsedEnd.getTime())) overviewOptions.endDate = parsedEnd;
 
-    const totalEnrolled = campaign.enrollments.length;
-    const sentMessages = campaign.messages.filter(m => m.status === 'sent' || m.status === 'delivered');
-    const sentCount = sentMessages.length;
-    
-    // Sequence started = enrollments that have received at least one send or are active
-    const sequenceStarted = campaign.enrollments.filter(e => e.lastSentAt || ['active', 'replied', 'completed', 'bounced'].includes(e.status)).length;
+    const overview = await AnalyticsService.getCampaignOverview(campaignId, overviewOptions);
 
-    // Events
-    const openedEvents = campaign.events.filter(e => e.eventType === 'opened' || e.eventType === 'email.opened');
-    const clickedEvents = campaign.events.filter(e => e.eventType === 'clicked' || e.eventType === 'email.clicked');
-    const repliedEvents = campaign.events.filter(e => e.eventType === 'replied' || e.eventType === 'email.replied');
-
-    // Check enrollment statuses
-    const repliedEnrollments = campaign.enrollments.filter(e => e.status === 'replied').length;
-    const repliesCount = Math.max(repliedEvents.length, repliedEnrollments);
-
-    const registeredEnrollments = campaign.enrollments.filter(e => e.status === 'registered').length;
-    const registrationsCount = Math.max(campaign.conversions.length, registeredEnrollments);
-
-    const openRate = sentCount > 0 ? Math.round((openedEvents.length / sentCount) * 100) : 0;
-    const clickRate = sentCount > 0 ? Math.round((clickedEvents.length / sentCount) * 100) : 0;
-    const replyRate = sentCount > 0 ? Math.round((repliesCount / sentCount) * 100) : 0;
-
-    // Generate 7-day Activity Timeline chart data
-    const chartData = [];
-    const now = new Date();
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
-      const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
-
-      const daySent = campaign.messages.filter(m => {
-        const t = m.sentAt || m.createdAt;
-        return t && t >= dayStart && t <= dayEnd && (m.status === 'sent' || m.status === 'delivered');
-      }).length;
-
-      const dayOpens = campaign.events.filter(e => {
-        const t = e.eventAt || e.createdAt;
-        return t && t >= dayStart && t <= dayEnd && (e.eventType === 'opened' || e.eventType === 'email.opened');
-      }).length;
-
-      const dayReplies = campaign.events.filter(e => {
-        const t = e.eventAt || e.createdAt;
-        return t && t >= dayStart && t <= dayEnd && (e.eventType === 'replied' || e.eventType === 'email.replied');
-      }).length;
-
-      chartData.push({
-        date: dateStr,
-        sent: daySent,
-        opens: dayOpens,
-        replies: dayReplies
-      });
-    }
+    const chartData = await AnalyticsService.getCampaignActivityTimeline(
+      campaignId,
+      parsedDays,
+      overview.timezone
+    );
 
     res.status(200).json({
-      summary: {
-        totalEnrolled,
-        sequenceStarted: sequenceStarted > 0 ? sequenceStarted : (sentCount > 0 ? sentCount : 0),
-        sent: sentCount,
-        delivered: sentCount,
-        opened: openedEvents.length,
-        clicked: clickedEvents.length,
-        replies: repliesCount,
-        registrations: registrationsCount,
-        openRate,
-        clickRate,
-        replyRate
-      },
-      chartData
+      summary: overview.summary,
+      funnel: overview.funnel,
+      chartData,
+      timezone: overview.timezone
     });
   } catch (error: any) {
     console.error('Error fetching campaign analytics:', error);
     res.status(500).json({ error: error?.message || 'Failed to fetch campaign analytics' });
+  }
+};
+
+export const getCampaignStepAnalytics = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const campaignId = String(id);
+
+    const steps = await AnalyticsService.getCampaignStepPerformance(campaignId);
+    res.status(200).json(steps);
+  } catch (error: any) {
+    console.error('Error fetching campaign step analytics:', error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch step analytics' });
+  }
+};
+
+export const getCampaignLinkAnalytics = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const campaignId = String(id);
+
+    const links = await AnalyticsService.getCampaignLinkPerformance(campaignId);
+    res.status(200).json(links);
+  } catch (error: any) {
+    console.error('Error fetching campaign link analytics:', error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch link analytics' });
+  }
+};
+
+export const getCampaignContactAnalytics = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const campaignId = String(id);
+    const filter = String(req.query.filter || 'ALL');
+
+    const contacts = await AnalyticsService.getCampaignContactEngagement(campaignId, filter);
+    res.status(200).json(contacts);
+  } catch (error: any) {
+    console.error('Error fetching campaign contact analytics:', error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch contact analytics' });
+  }
+};
+
+export const getContactTimeline = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id, enrollmentId } = req.params;
+    const campaignId = String(id);
+
+    const timeline = await AnalyticsService.getContactActivityTimeline(campaignId, String(enrollmentId));
+    res.status(200).json(timeline);
+  } catch (error: any) {
+    console.error('Error fetching contact timeline:', error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch contact timeline' });
+  }
+};
+
+export const exportCampaignAnalytics = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const campaignId = String(id);
+
+    const csvData = await AnalyticsService.exportCampaignAnalyticsCsv(campaignId);
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="campaign-${campaignId}-analytics.csv"`);
+    res.status(200).send(csvData);
+  } catch (error: any) {
+    console.error('Error exporting campaign analytics:', error);
+    res.status(500).json({ error: error?.message || 'Failed to export campaign analytics' });
   }
 };

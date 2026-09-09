@@ -688,33 +688,10 @@ export const generateLeadDraft = async (req: Request, res: Response): Promise<vo
 export const getCampaignLeads = async (req: Request, res: Response): Promise<void> => { 
   try {
     const { id } = req.params;
-    const enrollments = await prisma.enrollment.findMany({
-      where: { campaignId: String(id) },
-      include: { contact: { include: { organization: true, emails: true } } },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    const formatted = enrollments.map(e => ({
-      id: e.id,
-      contactId: e.contactId,
-      email: e.contact.emails.find((em: any) => em.isPrimary)?.email || e.contact.emails[0]?.email,
-      firstName: e.contact.firstName,
-      lastName: e.contact.lastName,
-      fullName: e.contact.fullName,
-      title: e.contact.jobTitle,
-      company: e.contact.organization?.name,
-      website: e.contact.organization?.domain,
-      industry: e.contact.organization?.industry,
-      city: e.contact.city,
-      personalizedLine: e.contact.personalizedLine,
-      personalization: e.contact.personalizedLine,
-      status: e.status,
-      currentStep: e.currentStep,
-      nextSendAt: e.nextSendAt,
-      stopReason: e.stopReason
-    }));
-    
-    res.status(200).json(formatted);
+    const filter = String(req.query.filter || 'ALL');
+    const { AnalyticsService } = await import('../services/analyticsService');
+    const contacts = await AnalyticsService.getCampaignContactEngagement(String(id), filter);
+    res.status(200).json(contacts);
   } catch (error) {
     console.error('Error fetching enrollments:', error);
     res.status(500).json({ error: 'Failed to fetch enrollments' });
