@@ -2,7 +2,7 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "src/index.ts",
+  "main": "dist/src/index.js",
   "allowScripts": {
     "@google/genai": true,
     "@prisma/client": true,
