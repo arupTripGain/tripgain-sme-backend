@@ -16,6 +16,10 @@ import {
   getCampaignEnrollmentCountsByMailbox,
   selectFairMailbox
 } from './rotationService';
+import {
+  calculateNextEligibleSendTime,
+  resolveEffectiveSendingDays
+} from '../utils/businessDays';
 
 const prisma = new PrismaClient();
 
@@ -916,7 +920,42 @@ export async function processEmailScheduler(options: {
           });
 
           const delaySeconds = options.force ? 5 : getRandomDelay();
-          const nextSendTime = nextStep ? new Date(Date.now() + nextStep.delayDays * 86400000) : null;
+          let nextSendTime: Date | null = null;
+
+          if (nextStep) {
+            if (options.force) {
+              // Forced execution advances with minimal delay for immediate testing
+              nextSendTime = new Date(Date.now() + 5000);
+            } else {
+              // Resolve effective timezone: assigned mailbox timezone takes precedence for delivery window,
+              // falling back to campaign timezone, defaulting to 'Asia/Kolkata'
+              const timezone = mailbox?.sendingTimezone || campaign.timezone || 'Asia/Kolkata';
+
+              // Resolve effective sending days: intersection of campaign and assigned mailbox
+              // Fails closed (empty array) if days cannot be safely resolved
+              const effectiveSendingDays = resolveEffectiveSendingDays({
+                campaignDays: campaign.sendingDays,
+                mailboxDays: mailbox?.sendingDays
+              });
+
+              nextSendTime = calculateNextEligibleSendTime({
+                from: new Date(),
+                delayDays: Number(nextStep.delayDays ?? 0),
+                sendingDays: effectiveSendingDays,
+                sendingWindowStart: mailbox?.sendingStartTime || campaign.sendingWindowStart || '09:30',
+                sendingWindowEnd: mailbox?.sendingEndTime || campaign.sendingWindowEnd || '17:30',
+                timezone
+              });
+
+              if (!nextSendTime && effectiveSendingDays.length === 0) {
+                console.warn(
+                  `[Scheduler] Enrollment ${enrollment.id} (Campaign "${campaign.name}", Mailbox "${mailbox.email}") ` +
+                  `has no overlapping eligible sending days between campaign and mailbox. Sequence follow-up held (nextSendAt: null).`
+                );
+              }
+            }
+          }
+
           const newStatus = nextStep ? 'active' : (isBulk ? 'sent' : 'completed');
           
           await prisma.enrollment.update({
