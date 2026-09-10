@@ -52,6 +52,9 @@ export const getLists = async (req: Request, res: Response): Promise<void> => {
       id: list.id,
       name: list.name,
       contacts: list._count.members,
+      contactCount: list._count.members,
+      memberCount: list._count.members,
+      _count: { members: list._count.members, contacts: list._count.members },
       type: list.listType,
       status: 'Active'
     }));
@@ -65,6 +68,9 @@ export const getLists = async (req: Request, res: Response): Promise<void> => {
       id: 'suppression-1',
       name: 'Suppression List',
       contacts: suppressionCount,
+      contactCount: suppressionCount,
+      memberCount: suppressionCount,
+      _count: { members: suppressionCount, contacts: suppressionCount },
       type: 'system',
       status: 'Active'
     });
@@ -180,14 +186,20 @@ export const getListById = async (req: Request, res: Response): Promise<void> =>
     
     const formattedContacts = resolvedContacts.map(c => ({
       id: c.id,
-      fullName: c.fullName,
+      firstName: c.firstName,
+      lastName: c.lastName,
+      fullName: c.fullName || `${c.firstName || ''} ${c.lastName || ''}`.trim(),
       email: c.emails?.find((e: any) => e.isPrimary)?.email || c.emails?.[0]?.email,
+      emails: c.emails,
       jobTitle: c.jobTitle,
       companyName: c.organization?.name,
+      organization: c.organization,
       industry: c.organization?.industry,
+      city: c.city,
       status: c.leadStatus || 'Cold',
       lists: c.listMemberships?.map((m: any) => m.list?.name) || [],
       personalizedLine: c.personalizedLine,
+      personalization: c.personalizedLine,
       personalizationStatus: c.personalizationStatus,
       personalizationSource: c.personalizationSource,
       personalizationConfidence: c.personalizationConfidence,

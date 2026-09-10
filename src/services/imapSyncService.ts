@@ -13,6 +13,71 @@ export interface SyncResult {
   error?: string;
 }
 
+export interface BounceClassification {
+  isBounce: boolean;
+  bounceType: 'hard' | 'soft' | 'unknown';
+  targetEmail: string | null;
+  dsnCode?: string | undefined;
+  reason?: string | undefined;
+}
+
+export function classifyBounce(
+  senderEmail: string,
+  subject: string,
+  bodyText: string,
+  knownProspectEmails: string[] = []
+): BounceClassification {
+  const sEmail = (senderEmail || '').toLowerCase();
+  const subj = (subject || '').toLowerCase();
+  const text = (bodyText || '').toLowerCase();
+
+  const isBounceSender = sEmail.includes('mailer-daemon') || sEmail.includes('postmaster') || sEmail.includes('mail-daemon') || sEmail.includes('bounce');
+  const isBounceSubject = /delivery status notification|undelivered mail|mail delivery failed|returned mail|failure notice|delivery failure|undeliverable/i.test(subj);
+
+  if (!isBounceSender && !isBounceSubject) {
+    return { isBounce: false, bounceType: 'unknown', targetEmail: null };
+  }
+
+  // Find which of our prospect emails is mentioned in the bounce message
+  let targetEmail: string | null = null;
+  for (const email of knownProspectEmails) {
+    if (text.includes(email.toLowerCase())) {
+      targetEmail = email.toLowerCase();
+      break;
+    }
+  }
+
+  // Fallback: extract email following "Final-Recipient:", "message to", etc.
+  if (!targetEmail) {
+    const finalRecMatch = text.match(/(?:final-recipient:\s*(?:rfc822;\s*)?|(?:failed|message|delivery|undelivered|recipient)\s+(?:to|for)?\s*:?\s*)<?([^\s<;]+@[^\s>;]+)>?/i);
+    if (finalRecMatch && finalRecMatch[1]) {
+      targetEmail = finalRecMatch[1].trim().toLowerCase().replace(/[>.,;:]$/, '');
+    }
+  }
+
+  const isHard = /5\.\d+\.\d+|user unknown|no such user|does not exist|invalid recipient|permanent failure|address rejected|recipient rejected|mailbox unavailable|account disabled|domain not found/i.test(subj + ' ' + text);
+  const isSoft = /4\.\d+\.\d+|mailbox full|quota exceeded|try again later|server busy|temporarily deferred|temporarily unavailable|message size exceeds/i.test(subj + ' ' + text);
+
+  let bounceType: 'hard' | 'soft' | 'unknown' = 'unknown';
+  if (isHard) {
+    bounceType = 'hard';
+  } else if (isSoft) {
+    bounceType = 'soft';
+  } else {
+    bounceType = 'unknown';
+  }
+
+  const dsnMatch = (subj + ' ' + text).match(/(?:status:?\s*|code:?\s*|\b)([45]\.\d+\.\d+)\b/i);
+
+  return {
+    isBounce: true,
+    bounceType,
+    targetEmail,
+    dsnCode: dsnMatch ? dsnMatch[1] : undefined,
+    reason: isHard ? 'Permanent address failure' : (isSoft ? 'Temporary delivery deferral' : 'Unclassified delivery failure')
+  };
+}
+
 function cleanHeaderId(id?: string | null): string {
   if (!id) return '';
   return id.replace(/^<+|>+$/g, '').trim().toLowerCase();
@@ -149,6 +214,176 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
           }
 
           if (!senderEmail) continue;
+
+          // ========================================================
+          // 1. BOUNCE PROCESSING (Hard bounce vs Soft bounce vs Unknown)
+          // ========================================================
+          const knownEmails = Array.from(enrolledEmailsMap.keys());
+          const bounceInfo = classifyBounce(senderEmail, subject, bodyText, knownEmails);
+
+          if (bounceInfo.isBounce && bounceInfo.targetEmail) {
+            const targetNorm = bounceInfo.targetEmail.toLowerCase();
+            const enrolledData = enrolledEmailsMap.get(targetNorm);
+            const contactId = enrolledData?.contact?.id;
+
+            const emailMessage = await prisma.emailMessage.findFirst({
+              where: {
+                toEmail: { equals: targetNorm, mode: 'insensitive' },
+                status: { in: ['sent', 'delivered', 'pending', 'queued'] }
+              },
+              orderBy: { sentAt: 'desc' }
+            });
+
+            if (bounceInfo.bounceType === 'hard') {
+              // 3A: HARD BOUNCE: mark message bounced, mark enrollment bounced, suppress address, block future sends
+              if (emailMessage) {
+                await prisma.emailMessage.update({
+                  where: { id: emailMessage.id },
+                  data: {
+                    status: 'bounced',
+                    bouncedAt: receivedDate,
+                    lastEventAt: receivedDate
+                  }
+                });
+
+                await prisma.emailEvent.create({
+                  data: {
+                    provider: 'IMAP_DSN',
+                    eventType: 'bounced',
+                    emailMessageId: emailMessage.id,
+                    contactId: emailMessage.contactId,
+                    campaignId: emailMessage.campaignId,
+                    enrollmentId: emailMessage.enrollmentId,
+                    recipientEmail: targetNorm,
+                    senderEmail: mailbox.email,
+                    metadata: { bounceType: 'hard', dsnCode: bounceInfo.dsnCode, reason: bounceInfo.reason },
+                    eventAt: receivedDate
+                  }
+                });
+              }
+
+              if (contactId) {
+                await prisma.enrollment.updateMany({
+                  where: { contactId, status: { in: ['pending', 'active', 'sending'] } },
+                  data: {
+                    status: 'bounced',
+                    stoppedAt: receivedDate,
+                    stopReason: 'HARD_BOUNCE'
+                  }
+                });
+
+                await prisma.contactEmail.updateMany({
+                  where: { normalizedEmail: targetNorm },
+                  data: { verificationStatus: 'bounced', bounceCount: { increment: 1 }, lastBouncedAt: receivedDate }
+                });
+              }
+
+              // Add to suppression list
+              await prisma.suppressionList.upsert({
+                where: { normalizedEmail: targetNorm },
+                update: { reason: 'hard_bounce', suppressedAt: receivedDate },
+                create: {
+                  email: targetNorm,
+                  normalizedEmail: targetNorm,
+                  reason: 'hard_bounce',
+                  userId: mailbox.userId,
+                  suppressedAt: receivedDate
+                }
+              });
+
+              syncedCount++;
+              continue;
+            } else if (bounceInfo.bounceType === 'soft') {
+              // 3B: SOFT BOUNCE: mark message soft_bounced, mark enrollment soft_bounced, STOP further sending, NO auto-retry, NOT permanently suppressed
+              if (emailMessage) {
+                await prisma.emailMessage.update({
+                  where: { id: emailMessage.id },
+                  data: {
+                    status: 'soft_bounced',
+                    lastEventAt: receivedDate
+                  }
+                });
+
+                await prisma.emailEvent.create({
+                  data: {
+                    provider: 'IMAP_DSN',
+                    eventType: 'soft_bounced',
+                    emailMessageId: emailMessage.id,
+                    contactId: emailMessage.contactId,
+                    campaignId: emailMessage.campaignId,
+                    enrollmentId: emailMessage.enrollmentId,
+                    recipientEmail: targetNorm,
+                    senderEmail: mailbox.email,
+                    metadata: { bounceType: 'soft', dsnCode: bounceInfo.dsnCode, reason: bounceInfo.reason },
+                    eventAt: receivedDate
+                  }
+                });
+              }
+
+              if (contactId) {
+                await prisma.enrollment.updateMany({
+                  where: { contactId, status: { in: ['pending', 'active', 'sending'] } },
+                  data: {
+                    status: 'soft_bounced',
+                    stoppedAt: receivedDate,
+                    stopReason: 'SOFT_BOUNCE'
+                  }
+                });
+
+                await prisma.contactEmail.updateMany({
+                  where: { contactId, normalizedEmail: targetNorm },
+                  data: {
+                    verificationStatus: 'soft_bounced',
+                    lastBouncedAt: receivedDate
+                  }
+                });
+              }
+
+              syncedCount++;
+              continue;
+            } else {
+              // 3C: UNKNOWN DELIVERY FAILURE: FAIL CLOSED, record reason, mark failed, STOP sending, NO retry
+              if (emailMessage) {
+                await prisma.emailMessage.update({
+                  where: { id: emailMessage.id },
+                  data: {
+                    status: 'failed',
+                    failureReason: bounceInfo.reason || 'Unclassified delivery failure',
+                    lastEventAt: receivedDate
+                  }
+                });
+
+                await prisma.emailEvent.create({
+                  data: {
+                    provider: 'IMAP_DSN',
+                    eventType: 'failed',
+                    emailMessageId: emailMessage.id,
+                    contactId: emailMessage.contactId,
+                    campaignId: emailMessage.campaignId,
+                    enrollmentId: emailMessage.enrollmentId,
+                    recipientEmail: targetNorm,
+                    senderEmail: mailbox.email,
+                    metadata: { failureReason: bounceInfo.reason, source: 'IMAP_DSN' },
+                    eventAt: receivedDate
+                  }
+                });
+              }
+
+              if (contactId) {
+                await prisma.enrollment.updateMany({
+                  where: { contactId, status: { in: ['pending', 'active', 'sending'] } },
+                  data: {
+                    status: 'failed',
+                    stoppedAt: receivedDate,
+                    stopReason: 'DELIVERY_FAILED_UNKNOWN'
+                  }
+                });
+              }
+
+              syncedCount++;
+              continue;
+            }
+          }
 
           // ========================================================
           // STRICT FILTER: IS THIS A REPLY TO A TRIPGAIN EMAIL?
@@ -292,6 +527,40 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                 stopReason: 'REPLY_RECEIVED'
               }
             });
+
+            // Also update latest outbound EmailMessage and record replied EmailEvent for analytics
+            const latestOutbound = await prisma.emailMessage.findFirst({
+              where: {
+                contactId: conversation.contactId,
+                status: { in: ['sent', 'delivered', 'opened', 'clicked'] }
+              },
+              orderBy: { sentAt: 'desc' }
+            });
+
+            if (latestOutbound) {
+              await prisma.emailMessage.update({
+                where: { id: latestOutbound.id },
+                data: {
+                  status: 'replied',
+                  repliedAt: receivedDate,
+                  lastEventAt: receivedDate
+                }
+              });
+
+              await prisma.emailEvent.create({
+                data: {
+                  provider: 'IMAP',
+                  eventType: 'replied',
+                  emailMessageId: latestOutbound.id,
+                  contactId: conversation.contactId,
+                  campaignId: latestOutbound.campaignId,
+                  enrollmentId: latestOutbound.enrollmentId,
+                  senderEmail,
+                  recipientEmail: mailbox.email,
+                  eventAt: receivedDate
+                }
+              });
+            }
           }
 
           syncedCount++;

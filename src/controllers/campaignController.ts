@@ -29,7 +29,9 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
 
     const scope = req.query.scope as string | undefined;
 
-    let whereClause: any = {};
+    let whereClause: any = {
+      campaignType: { not: 'BULK_EMAIL' }
+    };
     if (user.role === 'ADMIN' && scope === 'all') {
       // Admin specifically viewing workspace-wide campaigns
     } else {
@@ -805,6 +807,12 @@ export const updateEnrollmentStatus = async (req: Request, res: Response): Promi
     if (action === 'pause') {
       updateData = { status: 'paused', pausedAt: now, pauseReason: reason || 'MANUALLY_PAUSED' };
     } else if (action === 'resume') {
+      if (['bounced', 'soft_bounced'].includes(enrollment.status)) {
+        res.status(400).json({ 
+          error: `Cannot resume a ${enrollment.status} enrollment. Explicit user-controlled "Re-validate & Allow Sending" is required.` 
+        });
+        return;
+      }
       updateData = { status: 'active', pausedAt: null, pauseReason: null };
       if (!enrollment.nextSendAt) updateData.nextSendAt = now;
     } else if (action === 'stop') {

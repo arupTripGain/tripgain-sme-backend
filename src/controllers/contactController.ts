@@ -558,3 +558,112 @@ export const exportContacts = async (req: Request, res: Response): Promise<void>
     res.status(500).json({ error: 'Failed to export contacts' });
   }
 };
+
+export const revalidateSoftBounceContact = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
+    const { id } = req.params;
+    const { confirm } = req.body;
+
+    // 1. Require intentional user confirmation
+    if (confirm !== true) {
+      res.status(400).json({ 
+        error: 'Intentional confirmation required. Set { confirm: true } to proceed with "Re-validate & Allow Sending".' 
+      });
+      return;
+    }
+
+    // 2. Authenticated & ownership protected
+    const contact = await OwnershipGuard.assertContact(req, res, String(id));
+    if (!contact) return;
+
+    const contactWithEmails = await prisma.contact.findUnique({
+      where: { id: contact.id },
+      include: { emails: true }
+    });
+
+    if (!contactWithEmails || !contactWithEmails.emails || contactWithEmails.emails.length === 0) {
+      res.status(404).json({ error: 'Contact has no email addresses on file.' });
+      return;
+    }
+
+    const primaryEmail = contactWithEmails.emails.find(e => e.isPrimary) || contactWithEmails.emails[0];
+    if (!primaryEmail) {
+      res.status(404).json({ error: 'Contact has no email addresses on file.' });
+      return;
+    }
+    const normEmail = primaryEmail.normalizedEmail?.toLowerCase() || primaryEmail.email?.toLowerCase();
+
+    // 5. NEVER remove a hard-bounce or unsubscribe suppression
+    const hardSuppression = await prisma.suppressionList.findFirst({
+      where: { normalizedEmail: normEmail }
+    });
+
+    if (hardSuppression) {
+      res.status(403).json({ 
+        error: `Address is permanently suppressed (${hardSuppression.reason}). Hard-bounce or unsubscribe suppressions can NEVER be removed.` 
+      });
+      return;
+    }
+
+    if (primaryEmail.verificationStatus === 'bounced' || (primaryEmail.bounceCount && primaryEmail.bounceCount > 0)) {
+      res.status(403).json({ 
+        error: 'Contact email has a recorded hard bounce and cannot be unblocked.' 
+      });
+      return;
+    }
+
+    // 4. Perform syntax and domain validation before clearing block
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!normEmail || !emailRegex.test(normEmail)) {
+      res.status(400).json({ error: 'Re-validation failed: Invalid email syntax or format.' });
+      return;
+    }
+
+    const domain = normEmail.split('@')[1];
+    if (!domain || !domain.includes('.')) {
+      res.status(400).json({ error: 'Re-validation failed: Invalid domain format.' });
+      return;
+    }
+
+    // Clear soft-bounce block on contactEmail (historical campaign enrollments remain soft_bounced as truthful audit record)
+    await prisma.contactEmail.update({
+      where: { id: primaryEmail.id },
+      data: {
+        verificationStatus: 'valid',
+        isValid: true
+      }
+    });
+
+    // 3. Log / Audit action in ActivityLog
+    await prisma.activityLog.create({
+      data: {
+        workspaceId: contact.workspaceId,
+        userId: user.userId,
+        action: 'contact_soft_bounce_revalidated',
+        description: `Explicit user action "Re-validate & Allow Sending" completed for ${primaryEmail.email}`,
+        entityType: 'Contact',
+        entityId: contact.id,
+        metadata: {
+          email: primaryEmail.email,
+          previousStatus: primaryEmail.verificationStatus,
+          revalidatedAt: new Date().toISOString(),
+          performedBy: user.email || user.userId
+        }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Contact email successfully re-validated. Soft-bounce block cleared for future sends.',
+      contactId: contact.id,
+      email: primaryEmail.email,
+      verificationStatus: 'valid'
+    });
+  } catch (error) {
+    console.error('Error in revalidateSoftBounceContact:', error);
+    res.status(500).json({ error: 'Failed to re-validate soft-bounced contact' });
+  }
+};

@@ -446,6 +446,17 @@ export async function processEmailScheduler(options: {
             continue;
           }
 
+          // Re-verify campaign is still active (Kill switch / Pause check)
+          const freshCamp = await prisma.campaign.findUnique({
+            where: { id: campaign.id },
+            select: { status: true }
+          });
+          if (freshCamp?.status !== 'active') {
+            console.log(`[Scheduler] Campaign ${campaign.id} is ${freshCamp?.status}. Skipping dispatch.`);
+            emailsSkipped++;
+            continue;
+          }
+
           // 5. Load Contact and Render Template using Handlebars
           const contact = await prisma.contact.findUnique({ 
             where: { id: enrollment.contactId },
@@ -453,6 +464,48 @@ export async function processEmailScheduler(options: {
           });
 
           const primaryEmail = contact?.emails?.find(e => e.isPrimary)?.email || contact?.emails?.[0]?.email || 'test@example.com';
+          const normEmail = primaryEmail.trim().toLowerCase();
+
+          // Pre-dispatch suppression & unsubscribe safety check
+          const isSuppressed = await prisma.suppressionList.findFirst({
+            where: { normalizedEmail: normEmail }
+          });
+          if (isSuppressed || contact?.doNotContact || contact?.unsubscribeAt) {
+            console.log(`[Scheduler] Recipient ${primaryEmail} is suppressed or unsubscribed. Aborting dispatch.`);
+            await prisma.enrollment.update({
+              where: { id: enrollment.id },
+              data: {
+                status: 'unsubscribed',
+                stoppedAt: new Date(),
+                stopReason: isSuppressed ? `SUPPRESSED_${isSuppressed.reason.toUpperCase()}` : 'UNSUBSCRIBED',
+                lockedAt: null,
+                lockedBy: null,
+                lockExpiresAt: null
+              }
+            });
+            emailsSkipped++;
+            continue;
+          }
+
+          // Pre-dispatch soft-bounce reputation safety check
+          const hasSoftBounceState = contact?.emails?.some(e => e.verificationStatus === 'soft_bounced');
+          if (hasSoftBounceState) {
+            console.log(`[Scheduler] Recipient ${primaryEmail} has an active soft-bounce state. Aborting dispatch to protect sender reputation.`);
+            await prisma.enrollment.update({
+              where: { id: enrollment.id },
+              data: {
+                status: 'soft_bounced',
+                stoppedAt: new Date(),
+                stopReason: 'PREVIOUS_SOFT_BOUNCE',
+                lockedAt: null,
+                lockedBy: null,
+                lockExpiresAt: null
+              }
+            });
+            emailsSkipped++;
+            continue;
+          }
+
           const rawBody = step.bodyTemplate || step.bodyHtmlTemplate || '';
 
           const isSubjectEmpty = !step.subjectTemplate || step.subjectTemplate.trim().length === 0;
@@ -511,6 +564,14 @@ export async function processEmailScheduler(options: {
             }
           }
 
+          const trackingToken = crypto.randomUUID();
+          const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
+          let trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
+          if (!trackingBaseUrl && !isProduction) {
+            trackingBaseUrl = 'http://localhost:3001';
+          }
+          const unsubscribeLink = trackingBaseUrl ? `${trackingBaseUrl}/u/${trackingToken}` : '#';
+
           const templateData = {
             firstName: contact?.firstName || 'there',
             lastName: contact?.lastName || '',
@@ -524,7 +585,8 @@ export async function processEmailScheduler(options: {
             personalization: contact?.personalizedLine || '',
             personalizedLine: contact?.personalizedLine || '',
             senderName: mailbox.displayName || 'Arup Nirala',
-            senderCompany: 'TripGain'
+            senderCompany: 'TripGain',
+            unsubscribeLink
           };
 
           // Helper to sanitize template before Handlebars compile
@@ -598,8 +660,6 @@ export async function processEmailScheduler(options: {
             .replace(/<[^>]+>/g, '')
             .replace(/\n{3,}/g, '\n\n')
             .trim();
-
-          const trackingToken = crypto.randomUUID();
 
           // 6. Create Message Record (Pending)
           const message = await prisma.emailMessage.create({
@@ -716,13 +776,20 @@ export async function processEmailScheduler(options: {
               subject: renderedSubject,
               text: plainText,
               html: emailHtml,
-              messageId: internetMessageId
+              messageId: internetMessageId,
+              headers: {
+                ...(unsubscribeLink && unsubscribeLink !== '#' ? {
+                  'List-Unsubscribe': `<${unsubscribeLink}>`,
+                  'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+                } : {})
+              }
             };
 
             if (isReplyInThread && parentInternetMessageId) {
               mailOptions.inReplyTo = parentInternetMessageId;
               mailOptions.references = parentReferences || parentInternetMessageId;
               mailOptions.headers = {
+                ...mailOptions.headers,
                 'In-Reply-To': parentInternetMessageId,
                 'References': parentReferences || parentInternetMessageId,
                 ...(parentProviderThreadId ? { 'X-GM-THRID': parentProviderThreadId } : {})
@@ -843,19 +910,21 @@ export async function processEmailScheduler(options: {
           emailsSent++;
 
           // 10. Advance Enrollment
+          const isBulk = campaign.campaignType === 'BULK_EMAIL';
           const nextStep = await prisma.sequenceStep.findFirst({
             where: { sequenceId: enrollment.sequenceId, stepNumber: step.stepNumber + 1 }
           });
 
           const delaySeconds = options.force ? 5 : getRandomDelay();
           const nextSendTime = nextStep ? new Date(Date.now() + nextStep.delayDays * 86400000) : null;
+          const newStatus = nextStep ? 'active' : (isBulk ? 'sent' : 'completed');
           
           await prisma.enrollment.update({
             where: { id: enrollment.id },
             data: {
               mailboxId: enrollment.mailboxId || mailbox.id,
               currentStep: nextStep ? nextStep.stepNumber : step.stepNumber,
-              status: nextStep ? 'active' : 'completed',
+              status: newStatus,
               lastSentAt: new Date(),
               nextSendAt: nextSendTime,
             }
@@ -885,9 +954,11 @@ export async function processEmailScheduler(options: {
         } catch (error) {
           emailsFailed++;
           console.error(`[Scheduler] Error processing enrollment ${enrollment.id}:`, error);
+          const isBulk = campaign.campaignType === 'BULK_EMAIL';
           await prisma.enrollment.update({
             where: { id: enrollment.id },
             data: {
+              status: isBulk ? 'failed' : enrollment.status,
               failureCount: { increment: 1 },
               lastError: 'SENDING_FAILED'
             }
@@ -898,6 +969,23 @@ export async function processEmailScheduler(options: {
             where: { id: enrollment.id, lockedBy: workerId },
             data: { lockedAt: null, lockedBy: null, lockExpiresAt: null }
           });
+        }
+      }
+
+      // If bulk campaign, check if all enrollments have finished pending/active
+      if (campaign.campaignType === 'BULK_EMAIL') {
+        const remainingPending = await prisma.enrollment.count({
+          where: {
+            campaignId: campaign.id,
+            status: { in: ['pending', 'sending', 'active'] }
+          }
+        });
+        if (remainingPending === 0) {
+          await prisma.campaign.update({
+            where: { id: campaign.id },
+            data: { status: 'completed' }
+          });
+          console.log(`[Scheduler] Bulk campaign ${campaign.id} has no remaining pending/active enrollments. Marked completed.`);
         }
       }
     }

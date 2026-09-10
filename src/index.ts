@@ -38,7 +38,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-import { createContact, getContacts, getContactById, bulkImportContacts, deleteContact, bulkDeleteContacts, updateContact, exportContacts } from './controllers/contactController';
+import { createContact, getContacts, getContactById, bulkImportContacts, deleteContact, bulkDeleteContacts, updateContact, exportContacts, revalidateSoftBounceContact } from './controllers/contactController';
 import { personalizeContact, editPersonalization, startBulkPersonalization, getBulkJobStatus, getListPersonalizationStats } from './controllers/personalizationController';
 import { createOrganization, getOrganizations } from './controllers/organizationController';
 import { createList, getLists, getListById, deleteList, addMembersToList, removeMembersFromList, updateList, duplicateList } from './controllers/listController';
@@ -85,6 +85,7 @@ app.put('/api/contacts/:id', authenticateToken, updateContact);
 app.delete('/api/contacts/:id', authenticateToken, deleteContact);
 app.post('/api/contacts/export', authenticateToken, exportContacts);
 app.post('/api/contacts/bulk-delete', authenticateToken, bulkDeleteContacts);
+app.post('/api/contacts/:id/revalidate-soft-bounce', authenticateToken, revalidateSoftBounceContact);
 
 // Organization routes
 app.post('/api/organizations', authenticateToken, createOrganization);
@@ -124,9 +125,25 @@ app.put('/api/campaigns/:id/steps', authenticateToken, updateCampaignSteps);
 app.post('/api/campaigns/draft', authenticateToken, generateLeadDraft);
 app.delete('/api/campaigns/:id', authenticateToken, deleteCampaign);
 
-import { handleRedirect, handleOpenTracking } from './controllers/trackingController';
+import { handleRedirect, handleOpenTracking, handleUnsubscribe } from './controllers/trackingController';
 import { simulateEvent, handleProviderWebhook } from './controllers/webhookController';
 import { getConversations, getConversationById, replyToConversation, performConversationAction, simulateLeadReply, syncReplies } from './controllers/uniboxController';
+import {
+  getBulkCampaigns,
+  getBulkCampaignById,
+  createBulkCampaign,
+  updateBulkCampaign,
+  deleteBulkCampaign,
+  getBulkCampaignPreflight,
+  sendBulkTestEmail,
+  queueBulkCampaign,
+  launchBulkCampaign,
+  pauseBulkCampaign,
+  resumeBulkCampaign,
+  cancelBulkCampaign,
+  getBulkCampaignAnalytics,
+  getBulkCampaignRecipients
+} from './controllers/bulkEmailController';
 import aiRoutes from './routes/aiRoutes';
 import { getAISettings, saveGeminiKey, removeGeminiKey } from './controllers/settingsAiController';
 
@@ -138,6 +155,22 @@ app.get('/api/settings/ai', authenticateToken, getAISettings);
 app.post('/api/settings/ai/gemini', authenticateToken, saveGeminiKey);
 app.delete('/api/settings/ai/gemini', authenticateToken, removeGeminiKey);
 
+// Bulk Email Module Routes (Strictly authenticated & user-isolated)
+app.get('/api/bulk-campaigns', authenticateToken, getBulkCampaigns);
+app.post('/api/bulk-campaigns', authenticateToken, createBulkCampaign);
+app.get('/api/bulk-campaigns/:id', authenticateToken, getBulkCampaignById);
+app.put('/api/bulk-campaigns/:id', authenticateToken, updateBulkCampaign);
+app.delete('/api/bulk-campaigns/:id', authenticateToken, deleteBulkCampaign);
+app.get('/api/bulk-campaigns/:id/preflight', authenticateToken, getBulkCampaignPreflight);
+app.post('/api/bulk-campaigns/:id/send-test', authenticateToken, sendBulkTestEmail);
+app.post('/api/bulk-campaigns/:id/queue', authenticateToken, queueBulkCampaign);
+app.post('/api/bulk-campaigns/:id/launch', authenticateToken, launchBulkCampaign);
+app.post('/api/bulk-campaigns/:id/pause', authenticateToken, pauseBulkCampaign);
+app.post('/api/bulk-campaigns/:id/resume', authenticateToken, resumeBulkCampaign);
+app.post('/api/bulk-campaigns/:id/cancel', authenticateToken, cancelBulkCampaign);
+app.get('/api/bulk-campaigns/:id/analytics', authenticateToken, getBulkCampaignAnalytics);
+app.get('/api/bulk-campaigns/:id/recipients', authenticateToken, getBulkCampaignRecipients);
+
 // Phase 6 Engine & Tracking
 app.get('/api/scheduler/tick', runTick);
 app.post('/api/scheduler/tick', runTick);
@@ -146,6 +179,10 @@ app.post('/api/webhooks/email-provider', handleProviderWebhook); // Phase 9
 app.get('/t/:trackingToken', handleOpenTracking); // Open tracking pixel
 app.get('/track/open/:trackingToken', handleOpenTracking);
 app.get('/r/:trackingToken', handleRedirect); // Phase 9 click tracking
+app.get('/u/:trackingToken', handleUnsubscribe); // One-click unsubscribe
+app.post('/u/:trackingToken', handleUnsubscribe);
+app.get('/unsubscribe/:trackingToken', handleUnsubscribe);
+app.post('/unsubscribe/:trackingToken', handleUnsubscribe);
 app.post('/api/campaigns/:id/enroll', authenticateToken, enrollLeads);
 app.put('/api/campaigns/:id/enrollments/:enrollmentId/status', authenticateToken, updateEnrollmentStatus);
 
