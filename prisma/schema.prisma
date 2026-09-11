@@ -30,7 +30,8 @@ model User {
   contacts        Contact[]
   lists           List[]
   suppressionEntries SuppressionList[]
-  aiKey           UserAIKey?
+  aiKeys          UserAIKey[]
+  aiModelPreferences AIModelPreference[]
   aiUsages        AIUsage[]
 }
 
@@ -704,8 +705,8 @@ model PersonalizationJob {
 
 model UserAIKey {
   id              String    @id @default(uuid())
-  userId          String    @unique
-  provider        String    @default("GEMINI")
+  userId          String
+  provider        String    @default("GEMINI") // GEMINI, OPENROUTER, XKIRO
   encryptedApiKey String
   keyLast4        String
   isActive        Boolean   @default(true)
@@ -714,6 +715,24 @@ model UserAIKey {
   updatedAt       DateTime  @updatedAt
 
   user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+model AIModelPreference {
+  id            String   @id @default(uuid())
+  userId        String
+  provider      String   // GEMINI, OPENROUTER, XKIRO
+  selectedModel String
+  isDefault     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+  @@index([userId])
 }
 
 model AIUsage {

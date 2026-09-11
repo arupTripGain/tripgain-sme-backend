@@ -3,11 +3,41 @@ import { PersonalizationService } from './personalizationService';
 
 const prisma = new PrismaClient();
 
+interface QueuedItem {
+  jobId: string;
+  contactId: string;
+  userId?: string | undefined;
+  force: boolean;
+}
+
+interface JobProgress {
+  total: number;
+  processed: number;
+  successful: number;
+  failed: number;
+  aborted: boolean;
+  abortReason?: string | undefined;
+}
+
 export class PersonalizationQueue {
-  private static activeJobs: Set<string> = new Set();
+  // Fair user queues: userId -> list of queued items
+  private static userQueues: Map<string, QueuedItem[]> = new Map();
+  // Job progress tracking: jobId -> progress stats
+  private static jobStats: Map<string, JobProgress> = new Map();
+  // Worker state flag
+  private static isWorkerRunning: boolean = false;
+  // Maximum global concurrent lead generations across all users
+  private static get MAX_GLOBAL_CONCURRENCY(): number {
+    return parseInt(process.env.AI_QUEUE_MAX_CONCURRENCY || '4', 10);
+  }
+  // Batch size taken per user per round-robin turn
+  private static get USER_TURN_BATCH_SIZE(): number {
+    return parseInt(process.env.AI_QUEUE_USER_BATCH_SIZE || '2', 10);
+  }
 
   /**
    * Starts a background bulk personalization job.
+   * Immediately enqueues items into fair multi-user queues and returns the job ID.
    */
   static async startBulkJob(params: {
     workspaceId: string;
@@ -69,11 +99,31 @@ export class PersonalizationQueue {
     });
 
     if (targetIds.length > 0) {
-      // Launch background worker without blocking
-      this.activeJobs.add(job.id);
-      this.processJob(job.id, targetIds, !!params.force, params.userId).catch(err => {
-        console.error(`[PersonalizationQueue] Error in job ${job.id}:`, err);
+      const userKey = params.userId || 'anonymous';
+      if (!this.userQueues.has(userKey)) {
+        this.userQueues.set(userKey, []);
+      }
+
+      this.jobStats.set(job.id, {
+        total: targetIds.length,
+        processed: 0,
+        successful: 0,
+        failed: 0,
+        aborted: false
       });
+
+      const queue = this.userQueues.get(userKey)!;
+      for (const contactId of targetIds) {
+        queue.push({
+          jobId: job.id,
+          contactId,
+          userId: params.userId,
+          force: Boolean(params.force)
+        });
+      }
+
+      // Trigger background fair worker loop
+      this.ensureWorkerRunning();
     }
 
     return {
@@ -84,96 +134,120 @@ export class PersonalizationQueue {
   }
 
   /**
-   * Worker executing batch items with controlled concurrency.
+   * Ensures the fair round-robin worker loop is active.
    */
-  private static async processJob(
-    jobId: string,
-    contactIds: string[],
-    force: boolean,
-    userId?: string
-  ): Promise<void> {
-    const BATCH_SIZE = 2; // Process 2 leads at a time to stay within rate limits
-    let processed = 0;
-    let successful = 0;
-    let failed = 0;
-    let abortJob = false;
+  private static ensureWorkerRunning(): void {
+    if (this.isWorkerRunning) return;
+    this.isWorkerRunning = true;
 
+    // Run asynchronously in background without blocking caller
+    (async () => {
+      try {
+        await this.runFairWorkerLoop();
+      } catch (err) {
+        console.error('[PersonalizationQueue] Fatal error in fair worker loop:', err);
+      } finally {
+        this.isWorkerRunning = false;
+      }
+    })();
+  }
+
+  /**
+   * Fair Round-Robin Worker Loop:
+   * Cycles through active user queues (User A -> User B -> User C -> User A...)
+   * taking up to USER_TURN_BATCH_SIZE tasks per turn.
+   */
+  private static async runFairWorkerLoop(): Promise<void> {
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-    try {
-      for (let i = 0; i < contactIds.length; i += BATCH_SIZE) {
-        if (abortJob) break;
-        const batch = contactIds.slice(i, i + BATCH_SIZE);
+    while (this.hasPendingTasks()) {
+      const userKeys = Array.from(this.userQueues.keys());
 
+      for (const userKey of userKeys) {
+        const queue = this.userQueues.get(userKey);
+        if (!queue || queue.length === 0) {
+          this.userQueues.delete(userKey);
+          continue;
+        }
+
+        // Take small batch for this user
+        const batch = queue.splice(0, this.USER_TURN_BATCH_SIZE);
+        if (batch.length === 0) continue;
+
+        // Process this user's turn
         await Promise.all(
-          batch.map(async (contactId) => {
+          batch.map(async (item) => {
+            const stats = this.jobStats.get(item.jobId);
+            if (stats?.aborted) {
+              // Skip aborted job items
+              return;
+            }
+
             try {
-              const res = await PersonalizationService.generateForContact(contactId, force, userId);
-              if (res.success && res.personalization) {
-                successful++;
-              } else {
-                failed++;
-                if (res.code === 'AI_PROVIDER_NOT_CONFIGURED' || res.code === 'AI_USAGE_LIMIT_REACHED') {
-                  abortJob = true;
+              const res = await PersonalizationService.generateForContact(
+                item.contactId,
+                item.force,
+                item.userId
+              );
+
+              if (stats) {
+                stats.processed++;
+                if (res.success && res.personalization) {
+                  stats.successful++;
+                } else {
+                  stats.failed++;
+                  // Abort only this user's job if rate-limited or unconfigured
+                  if (
+                    res.code === 'AI_PROVIDER_NOT_CONFIGURED' ||
+                    res.code === 'AI_USAGE_LIMIT_REACHED' ||
+                    res.code === 'AI_RATE_LIMITED'
+                  ) {
+                    stats.aborted = true;
+                    stats.abortReason = res.reason || res.code;
+                    console.warn(`[PersonalizationQueue] Aborting job ${item.jobId} for user ${userKey}: ${stats.abortReason}`);
+                  }
                 }
               }
-            } catch (err) {
-              console.error(`[PersonalizationQueue] Failed contact ${contactId}:`, err);
-              failed++;
-            } finally {
-              processed++;
+            } catch (err: any) {
+              console.error(`[PersonalizationQueue] Error on contact ${item.contactId}:`, err?.message);
+              if (stats) {
+                stats.processed++;
+                stats.failed++;
+              }
+            }
+
+            // Sync database progress
+            if (stats) {
+              const isFinished = stats.processed >= stats.total || stats.aborted;
+              await prisma.personalizationJob.update({
+                where: { id: item.jobId },
+                data: {
+                  processed: stats.processed,
+                  successful: stats.successful,
+                  failed: stats.failed,
+                  status: isFinished ? (stats.aborted ? 'FAILED' : 'COMPLETED') : 'PROCESSING',
+                  updatedAt: new Date()
+                }
+              }).catch(() => {});
+
+              if (isFinished) {
+                this.jobStats.delete(item.jobId);
+              }
             }
           })
         );
 
-        // Update progress in database every batch
-        await prisma.personalizationJob.update({
-          where: { id: jobId },
-          data: {
-            processed,
-            successful,
-            failed,
-            updatedAt: new Date()
-          }
-        });
-
-        if (abortJob) {
-          console.warn(`[PersonalizationQueue] Aborting job ${jobId} due to unconfigured AI provider or quota limit`);
-          break;
-        }
-
-        // Small delay between batches to respect rate limits
-        if (i + BATCH_SIZE < contactIds.length) {
-          await sleep(300);
-        }
+        // Small inter-batch delay to respect provider rate limits
+        await sleep(150);
       }
-
-      // Mark completed or failed based on abort
-      await prisma.personalizationJob.update({
-        where: { id: jobId },
-        data: {
-          status: abortJob ? 'FAILED' : 'COMPLETED',
-          processed,
-          successful,
-          failed,
-          updatedAt: new Date()
-        }
-      });
-    } catch (err: any) {
-      console.error(`[PersonalizationQueue] Fatal error on job ${jobId}:`, err);
-      await prisma.personalizationJob.update({
-        where: { id: jobId },
-        data: {
-          status: 'FAILED',
-          processed,
-          successful,
-          failed,
-          updatedAt: new Date()
-        }
-      });
-    } finally {
-      this.activeJobs.delete(jobId);
     }
+  }
+
+  private static hasPendingTasks(): boolean {
+    for (const queue of this.userQueues.values()) {
+      if (queue.length > 0) return true;
+    }
+    return false;
   }
 
   /**

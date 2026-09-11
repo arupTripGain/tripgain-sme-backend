@@ -273,15 +273,8 @@ Target: SMEs with business travel requirements.
         feature: 'PERSONALIZATION',
         systemPrompt,
         userPrompt,
-        models: [
-          'gemini-flash-lite-latest',
-          'gemini-flash-latest',
-          'gemini-3.5-flash-lite',
-          'gemini-3.5-flash',
-          'gemini-2.5-flash'
-        ],
         temperature: 0.4,
-        maxOutputTokens: 250
+        maxOutputTokens: 500
       });
     } catch (err: any) {
       console.error('[PersonalizationService] Failed to generate personalization:', err?.message);

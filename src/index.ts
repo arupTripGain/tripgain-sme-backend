@@ -145,15 +145,35 @@ import {
   getBulkCampaignRecipients
 } from './controllers/bulkEmailController';
 import aiRoutes from './routes/aiRoutes';
-import { getAISettings, saveGeminiKey, removeGeminiKey } from './controllers/settingsAiController';
+import {
+  getAISettings,
+  saveGeminiKey,
+  removeGeminiKey,
+  saveOpenRouterKey,
+  removeOpenRouterKey,
+  saveXKiroKey,
+  removeXKiroKey,
+  removeAIKey,
+  testAIConnection,
+  getProviderModels,
+  saveAIPreference
+} from './controllers/settingsAiController';
 
 // AI Routes
 app.use('/api/ai', authenticateToken, aiRoutes);
 
-// Settings AI (BYOK Gemini)
+// Settings AI (BYOK Multi-Model: Gemini, OpenRouter, xKiro)
 app.get('/api/settings/ai', authenticateToken, getAISettings);
 app.post('/api/settings/ai/gemini', authenticateToken, saveGeminiKey);
 app.delete('/api/settings/ai/gemini', authenticateToken, removeGeminiKey);
+app.post('/api/settings/ai/openrouter', authenticateToken, saveOpenRouterKey);
+app.delete('/api/settings/ai/openrouter', authenticateToken, removeOpenRouterKey);
+app.post('/api/settings/ai/xkiro', authenticateToken, saveXKiroKey);
+app.delete('/api/settings/ai/xkiro', authenticateToken, removeXKiroKey);
+app.delete('/api/settings/ai/:provider', authenticateToken, removeAIKey);
+app.post('/api/settings/ai/preference', authenticateToken, saveAIPreference);
+app.post('/api/settings/ai/:provider/test', authenticateToken, testAIConnection);
+app.get('/api/settings/ai/:provider/models', authenticateToken, getProviderModels);
 
 // Bulk Email Module Routes (Strictly authenticated & user-isolated)
 app.get('/api/bulk-campaigns', authenticateToken, getBulkCampaigns);

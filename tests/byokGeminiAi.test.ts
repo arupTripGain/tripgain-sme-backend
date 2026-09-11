@@ -80,8 +80,11 @@ async function runBYOKTests() {
   const reqUserA = { userId: userA.id, email: userA.email, role: userA.role };
   const reqUserB = { userId: userB.id, email: userB.email, role: userB.role };
 
-  // Clean existing test AI keys for clean baseline
+  // Clean existing test AI keys and usage records for clean baseline
   await prisma.userAIKey.deleteMany({
+    where: { userId: { in: [userA.id, userB.id] } }
+  });
+  await prisma.aIUsage.deleteMany({
     where: { userId: { in: [userA.id, userB.id] } }
   });
 
@@ -189,7 +192,9 @@ async function runBYOKTests() {
       assert.strictEqual(res.data.encryptedApiKey, undefined, 'Encrypted API key must NOT be in JSON response');
 
       // Verify in DB directly:
-      const dbKeyA = await prisma.userAIKey.findUnique({ where: { userId: userA.id } });
+      const dbKeyA = await prisma.userAIKey.findUnique({
+        where: { userId_provider: { userId: userA.id, provider: 'GEMINI' } }
+      });
       assert(dbKeyA, 'User A key record must exist in DB');
       assert.strictEqual(dbKeyA.keyLast4, 'AAA1');
       assert.strictEqual(dbKeyA.isActive, true);
