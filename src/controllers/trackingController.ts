@@ -126,7 +126,8 @@ export const handleRedirect = async (req: Request, res: Response): Promise<void>
           data: {
             clickedAt: legacyMessage.clickedAt || new Date(),
             lastEventAt: new Date(),
-            status: legacyMessage.status === 'sent' || legacyMessage.status === 'delivered' ? 'clicked' : legacyMessage.status
+            status: legacyMessage.status === 'sent' || legacyMessage.status === 'delivered' ? 'clicked' : legacyMessage.status,
+            deliveryConfidence: 'ENGAGEMENT_CONFIRMED'
           }
         });
 
@@ -194,7 +195,8 @@ export const handleOpenTracking = async (req: Request, res: Response): Promise<v
           data: {
             openedAt: message.openedAt || new Date(),
             lastEventAt: new Date(),
-            status: message.status === 'sent' || message.status === 'delivered' ? 'opened' : message.status
+            status: message.status === 'sent' || message.status === 'delivered' ? 'opened' : message.status,
+            deliveryConfidence: 'ENGAGEMENT_CONFIRMED'
           }
         });
 

@@ -396,6 +396,7 @@ export async function processEmailScheduler(options: {
         }
 
       for (const enrollment of dueEnrollments) {
+        let message: any = null;
         try {
           // 1. Lock Enrollment (clearing expired locks if any, or confirming worker reservation from Step F)
           const locked = await prisma.enrollment.updateMany({
@@ -665,14 +666,16 @@ export async function processEmailScheduler(options: {
             .replace(/\n{3,}/g, '\n\n')
             .trim();
 
-          // 6. Create Message Record (Pending)
-          const message = await prisma.emailMessage.create({
+          // 6. Create Message Record (Pending / Dispatched)
+          message = await prisma.emailMessage.create({
             data: {
               idempotencyKey,
               enrollmentId: enrollment.id,
               campaignId: campaign.id,
               sequenceStepId: step.id,
               status: 'pending',
+              transportStatus: 'DISPATCHED',
+              deliveryConfidence: 'UNKNOWN',
               fromEmail: mailbox.email,
               toEmail: primaryEmail,
               subject: renderedSubject,
@@ -685,6 +688,8 @@ export async function processEmailScheduler(options: {
           console.log(`[Scheduler] Dispatching real email to ${message.toEmail} via ${mailbox.email} (step ${step.stepNumber})`);
           let providerMessageId = `msg_${crypto.randomUUID()}`;
           let internetMessageId = `<tg_${crypto.randomUUID()}@${mailbox.email.split('@')[1] || 'tripgainapp.com'}>`;
+          let rawSmtpResponse: string | null = null;
+          let smtpCode: string | null = null;
 
           if (mailbox.credentials) {
             const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
@@ -802,9 +807,19 @@ export async function processEmailScheduler(options: {
 
             const sendInfo = await transporter.sendMail(mailOptions);
 
-            if (sendInfo && sendInfo.messageId) {
-              internetMessageId = sendInfo.messageId;
-              providerMessageId = sendInfo.messageId;
+            if (sendInfo) {
+              if (sendInfo.messageId) {
+                internetMessageId = sendInfo.messageId;
+                providerMessageId = sendInfo.messageId;
+              }
+              if (sendInfo.response) {
+                rawSmtpResponse = String(sendInfo.response).trim();
+                const codeMatch = rawSmtpResponse.match(/\b([245]\d\d)\b/);
+                smtpCode = codeMatch && codeMatch[1] ? codeMatch[1] : '250';
+              } else {
+                smtpCode = '250';
+                rawSmtpResponse = '250 2.0.0 OK (Accepted)';
+              }
             }
           }
 
@@ -881,13 +896,19 @@ export async function processEmailScheduler(options: {
             console.warn('Could not register campaign email in Unibox:', convErr);
           }
 
-          // 9. Mark Sent in DB
+          // 9. Mark Sent in DB with Transport & Delivery Semantics
           await prisma.emailMessage.update({
             where: { id: message.id },
             data: {
               status: 'sent',
               sentAt: new Date(),
               providerMessageId,
+              internetMessageId,
+              transportStatus: 'SMTP_ACCEPTED',
+              deliveryConfidence: 'DELIVERY_INFERRED',
+              smtpAcceptedAt: new Date(),
+              smtpResponseCode: smtpCode || '250',
+              smtpResponse: rawSmtpResponse ? rawSmtpResponse.slice(0, 255) : '250 OK (Accepted)'
             }
           });
 
@@ -990,9 +1011,24 @@ export async function processEmailScheduler(options: {
             }
           });
 
-        } catch (error) {
+        } catch (error: any) {
           emailsFailed++;
           console.error(`[Scheduler] Error processing enrollment ${enrollment.id}:`, error);
+          if (message?.id) {
+            const errCodeMatch = (error?.message || '').match(/\b([45]\d\d)\b/);
+            await prisma.emailMessage.update({
+              where: { id: message.id },
+              data: {
+                status: 'failed',
+                failedAt: new Date(),
+                failureReason: (error?.message || 'SENDING_FAILED').slice(0, 255),
+                transportStatus: 'FAILED',
+                deliveryConfidence: 'UNKNOWN',
+                smtpResponseCode: errCodeMatch ? errCodeMatch[1] : (error?.responseCode ? String(error.responseCode) : '550'),
+                smtpResponse: (error?.response || error?.message || 'SMTP transport failure').slice(0, 255)
+              }
+            }).catch(() => {});
+          }
           const isBulk = campaign.campaignType === 'BULK_EMAIL';
           await prisma.enrollment.update({
             where: { id: enrollment.id },

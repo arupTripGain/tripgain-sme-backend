@@ -7,8 +7,16 @@ export interface CampaignAnalyticsSummary {
   sequenceStarted: number;
   sent: number;
   uniqueSent: number;
+  smtpAccepted: number;
   delivered: number;
+  deliveryInferred: number;
   uniqueDelivered: number;
+  uniqueDeliveryInferred: number;
+  deliveryConfidence?: {
+    unknown: number;
+    deliveryInferred: number;
+    engagementConfirmed: number;
+  };
   totalOpens: number;
   uniqueOpeners: number;
   uniqueOpenRate: number | null; // e.g. 80.0, or null if 0 delivered
@@ -51,6 +59,7 @@ export interface StepPerformanceRow {
   subject: string;
   sent: number;
   delivered: number;
+  deliveryInferred?: number;
   uniqueOpens: number;
   totalOpens: number;
   uniqueOpenRate: number | null;
@@ -59,6 +68,7 @@ export interface StepPerformanceRow {
   uniqueClickRate: number | null;
   replies: number;
   replyRate: number | null;
+  bounces?: number;
 }
 
 export interface LinkPerformanceRow {
@@ -322,7 +332,7 @@ export class AnalyticsService {
         dropOffPercentage: 0
       },
       {
-        stage: 'Delivered',
+        stage: 'Delivered (Inferred)',
         count: uniqueDelivered,
         percentageOfSent: fDeliveredPct,
         dropOffPercentage: uniqueSent > 0 ? Math.max(0, Number((((uniqueSent - uniqueDelivered) / uniqueSent) * 100).toFixed(1))) : 0
@@ -347,14 +357,36 @@ export class AnalyticsService {
       }
     ];
 
+    const smtpAcceptedCount = sentMessages.filter(
+      (m: any) => m.transportStatus === 'SMTP_ACCEPTED' || m.status === 'sent' || m.status === 'delivered' || m.status === 'opened' || m.status === 'clicked' || m.status === 'replied'
+    ).length;
+
+    const confConfirmed = campaign.messages.filter(
+      (m: any) => m.deliveryConfidence === 'ENGAGEMENT_CONFIRMED' || m.openedAt || m.clickedAt || m.repliedAt
+    ).length;
+    const confInferred = campaign.messages.filter(
+      (m: any) => (m.deliveryConfidence === 'DELIVERY_INFERRED' || (!m.deliveryConfidence && m.status !== 'bounced')) && !(m.openedAt || m.clickedAt || m.repliedAt)
+    ).length;
+    const confUnknown = campaign.messages.filter(
+      (m: any) => m.deliveryConfidence === 'UNKNOWN' || m.status === 'bounced' || m.status === 'failed' || m.status === 'pending'
+    ).length;
+
     return {
       summary: {
         totalEnrolled,
         sequenceStarted,
         sent: sentCount,
         uniqueSent,
+        smtpAccepted: smtpAcceptedCount,
         delivered: deliveredCount,
+        deliveryInferred: deliveredCount,
         uniqueDelivered,
+        uniqueDeliveryInferred: uniqueDelivered,
+        deliveryConfidence: {
+          unknown: confUnknown,
+          deliveryInferred: confInferred,
+          engagementConfirmed: confConfirmed
+        },
         totalOpens,
         uniqueOpeners,
         uniqueOpenRate,
@@ -533,6 +565,7 @@ export class AnalyticsService {
         subject: step.subjectTemplate || '(Reply in thread)',
         sent,
         delivered,
+        deliveryInferred: delivered,
         uniqueOpens,
         totalOpens,
         uniqueOpenRate,
@@ -540,7 +573,8 @@ export class AnalyticsService {
         totalClicks,
         uniqueClickRate,
         replies,
-        replyRate
+        replyRate,
+        bounces: bounced
       });
     }
 

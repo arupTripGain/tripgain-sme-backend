@@ -484,6 +484,18 @@ model EmailMessage {
   complainedAt      DateTime?
   repliedAt         DateTime?
   lastEventAt       DateTime?
+
+  // Transport & Delivery Semantics
+  transportStatus     String?   @default("DISPATCHED") // DISPATCHED, SMTP_ACCEPTED, BOUNCED, FAILED
+  deliveryConfidence  String?   @default("UNKNOWN")    // UNKNOWN, DELIVERY_INFERRED, ENGAGEMENT_CONFIRMED
+  smtpAcceptedAt      DateTime?
+  smtpResponseCode    String?
+  smtpResponse        String?
+  internetMessageId   String?
+  bounceType          String?   // hard, soft, unknown
+  bounceCode          String?
+  bounceReason        String?
+
   createdAt         DateTime @default(now())
 
   enrollment   Enrollment?   @relation(fields: [enrollmentId], references: [id])

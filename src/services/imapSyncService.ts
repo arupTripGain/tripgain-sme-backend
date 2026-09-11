@@ -242,7 +242,12 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                   data: {
                     status: 'bounced',
                     bouncedAt: receivedDate,
-                    lastEventAt: receivedDate
+                    lastEventAt: receivedDate,
+                    transportStatus: 'BOUNCED',
+                    deliveryConfidence: 'UNKNOWN',
+                    bounceType: 'hard',
+                    bounceCode: bounceInfo.dsnCode || '5.0.0',
+                    bounceReason: (bounceInfo.reason || 'Permanent address failure').slice(0, 255)
                   }
                 });
 
@@ -300,7 +305,13 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                   where: { id: emailMessage.id },
                   data: {
                     status: 'soft_bounced',
-                    lastEventAt: receivedDate
+                    bouncedAt: receivedDate,
+                    lastEventAt: receivedDate,
+                    transportStatus: 'BOUNCED',
+                    deliveryConfidence: 'UNKNOWN',
+                    bounceType: 'soft',
+                    bounceCode: bounceInfo.dsnCode || '4.0.0',
+                    bounceReason: (bounceInfo.reason || 'Temporary delivery deferral').slice(0, 255)
                   }
                 });
 
@@ -543,7 +554,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                 data: {
                   status: 'replied',
                   repliedAt: receivedDate,
-                  lastEventAt: receivedDate
+                  lastEventAt: receivedDate,
+                  deliveryConfidence: 'ENGAGEMENT_CONFIRMED'
                 }
               });
 
