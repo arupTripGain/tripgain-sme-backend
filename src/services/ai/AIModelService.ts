@@ -92,13 +92,13 @@ export class AIModelService {
   static getDefaultModel(provider: SupportedAIProvider): string {
     switch (provider) {
       case 'GEMINI':
-        return 'gemini-3.6-flash';
+        return 'gemini-flash-lite-latest';
       case 'OPENROUTER':
         return 'openrouter/free';
       case 'XKIRO':
         return 'qwen/qwen3.5-flash:free';
       default:
-        return 'gemini-3.6-flash';
+        return 'gemini-flash-lite-latest';
     }
   }
 }

@@ -343,7 +343,7 @@ export class AIProviderService {
         configured: false,
         keyLast4: null,
         provider: 'GEMINI',
-        selectedModel: 'gemini-3.6-flash',
+        selectedModel: 'gemini-flash-lite-latest',
         isActive: false,
         lastUsedAt: null,
         usageToday

@@ -55,7 +55,7 @@ export class ResearchService {
 
         sourceUrl = parsed.origin;
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 4500);
+        const timeoutId = setTimeout(() => controller.abort(), 2500);
 
         const response = await fetch(parsed.origin, {
           signal: controller.signal,

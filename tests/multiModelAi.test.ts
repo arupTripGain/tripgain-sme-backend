@@ -638,7 +638,7 @@ async function runMultiModelTests() {
       }
 
       // 14.4 Default model checks
-      assert.strictEqual(AIModelService.getDefaultModel('GEMINI'), 'gemini-3.6-flash');
+      assert.strictEqual(AIModelService.getDefaultModel('GEMINI'), 'gemini-flash-lite-latest');
       assert.strictEqual(AIModelService.getDefaultModel('OPENROUTER'), 'openrouter/free');
       assert.strictEqual(AIModelService.getDefaultModel('XKIRO'), 'qwen/qwen3.5-flash:free');
     }

@@ -153,7 +153,20 @@ export class PersonalizationService {
       data: { personalizationStatus: 'GENERATING' }
     });
 
-    const result = await this.executeGeneration(contact, userId);
+    let result: GenerationResult;
+    try {
+      result = await this.executeGeneration(contact, userId);
+    } catch (err: any) {
+      console.error(`[PersonalizationService] Unhandled error during generation for contact ${contactId}:`, err);
+      result = {
+        success: false,
+        personalization: null,
+        status: 'FAILED',
+        source: 'AI_RESEARCH',
+        confidence: 'LOW',
+        reason: err?.message || 'Generation failed with an unexpected error'
+      };
+    }
 
     // Save result to contact
     const updateData: any = {
@@ -246,16 +259,13 @@ PERSON:
 First Name: ${firstName || 'Unknown'}
 Last Name: ${lastName || ''}
 Title/Role: ${title || 'Leader'}
-LinkedIn: ${personLinkedinUrl || 'N/A'}
 City: ${city || 'N/A'}
-Email: ${primaryEmail || 'N/A'}
 
 COMPANY:
 Company Name: ${companyName || 'Unknown'}
 Website: ${website || 'N/A'}
 Industry: ${industry || 'N/A'}
 Company Size: ${companySize || 'N/A'}
-Company Phone: ${companyPhone || 'N/A'}
 
 PUBLIC RESEARCH SIGNALS:
 ${research.extractedSignals.length > 0 ? research.extractedSignals.join('\n') : 'No website content extracted.'}

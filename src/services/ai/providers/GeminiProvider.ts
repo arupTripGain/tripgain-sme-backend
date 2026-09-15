@@ -23,7 +23,7 @@ export class GeminiProvider implements AIProvider {
     const startTime = performance.now();
     const ai = new GoogleGenAI({ apiKey: this.apiKey });
 
-    const model = request.model || 'gemini-3.6-flash';
+    const model = request.model || 'gemini-flash-lite-latest';
 
     try {
       const response = await ai.models.generateContent({
@@ -99,9 +99,9 @@ export class GeminiProvider implements AIProvider {
   private getDefaultModels(): AIModel[] {
     return [
       {
-        id: 'gemini-3.6-flash',
-        name: 'Gemini 3.6 Flash [Curated Fallback]',
-        description: 'Google current recommended high-speed multimodal model (curated fallback catalog)',
+        id: 'gemini-flash-lite-latest',
+        name: 'Gemini Flash Lite [Curated Fallback]',
+        description: 'Ultra-fast lightweight generation for high-throughput outreach tasks (curated fallback catalog)',
         contextLength: 1000000,
         isFree: true,
         provider: 'GEMINI',
@@ -109,9 +109,19 @@ export class GeminiProvider implements AIProvider {
         isFallback: true
       },
       {
-        id: 'gemini-flash-lite-latest',
-        name: 'Gemini Flash Lite [Curated Fallback]',
-        description: 'Ultra-fast lightweight generation for high-throughput tasks (curated fallback catalog)',
+        id: 'gemini-3.5-flash-lite',
+        name: 'Gemini 3.5 Flash Lite [Curated Fallback]',
+        description: 'High-speed balanced model optimized for fast structured generation (curated fallback catalog)',
+        contextLength: 1000000,
+        isFree: true,
+        provider: 'GEMINI',
+        source: 'CURATED_FALLBACK',
+        isFallback: true
+      },
+      {
+        id: 'gemini-3.6-flash',
+        name: 'Gemini 3.6 Flash [Curated Fallback]',
+        description: 'Google current recommended multimodal reasoning model (curated fallback catalog)',
         contextLength: 1000000,
         isFree: true,
         provider: 'GEMINI',
@@ -153,7 +163,7 @@ export class GeminiProvider implements AIProvider {
         connected: true,
         provider: 'GEMINI',
         keyLast4: this.keyLast4,
-        selectedModel: 'gemini-3.6-flash',
+        selectedModel: 'gemini-flash-lite-latest',
         models,
         latencyMs
       };

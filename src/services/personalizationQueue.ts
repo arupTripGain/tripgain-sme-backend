@@ -28,11 +28,11 @@ export class PersonalizationQueue {
   private static isWorkerRunning: boolean = false;
   // Maximum global concurrent lead generations across all users
   private static get MAX_GLOBAL_CONCURRENCY(): number {
-    return parseInt(process.env.AI_QUEUE_MAX_CONCURRENCY || '4', 10);
+    return parseInt(process.env.AI_QUEUE_MAX_CONCURRENCY || '8', 10);
   }
   // Batch size taken per user per round-robin turn
   private static get USER_TURN_BATCH_SIZE(): number {
-    return parseInt(process.env.AI_QUEUE_USER_BATCH_SIZE || '2', 10);
+    return parseInt(process.env.AI_QUEUE_USER_BATCH_SIZE || '5', 10);
   }
 
   /**
@@ -47,6 +47,17 @@ export class PersonalizationQueue {
     onlyMissing?: boolean;
     force?: boolean;
   }): Promise<{ jobId: string; status: string; total: number }> {
+    // Auto-recover any contacts orphaned in 'GENERATING' status from prior server reloads or aborts
+    await prisma.contact.updateMany({
+      where: {
+        personalizationStatus: 'GENERATING',
+        updatedAt: { lt: new Date(Date.now() - 2 * 60 * 1000) }
+      },
+      data: {
+        personalizationStatus: 'PENDING'
+      }
+    }).catch(() => {});
+
     let targetIds: string[] = [];
 
     if (params.contactIds && params.contactIds.length > 0) {
@@ -184,11 +195,22 @@ export class PersonalizationQueue {
             }
 
             try {
-              const res = await PersonalizationService.generateForContact(
+              let res = await PersonalizationService.generateForContact(
                 item.contactId,
                 item.force,
                 item.userId
               );
+
+              // If rate limited, backoff and retry once before marking failed
+              if (!res.success && res.code === 'AI_RATE_LIMITED') {
+                console.warn(`[PersonalizationQueue] Rate limit hit for contact ${item.contactId}. Backing off 2.5s and retrying...`);
+                await sleep(2500);
+                res = await PersonalizationService.generateForContact(
+                  item.contactId,
+                  item.force,
+                  item.userId
+                );
+              }
 
               if (stats) {
                 stats.processed++;
@@ -196,11 +218,10 @@ export class PersonalizationQueue {
                   stats.successful++;
                 } else {
                   stats.failed++;
-                  // Abort only this user's job if rate-limited or unconfigured
+                  // Abort only if provider is completely unconfigured or user daily limit is exceeded
                   if (
                     res.code === 'AI_PROVIDER_NOT_CONFIGURED' ||
-                    res.code === 'AI_USAGE_LIMIT_REACHED' ||
-                    res.code === 'AI_RATE_LIMITED'
+                    res.code === 'AI_USAGE_LIMIT_REACHED'
                   ) {
                     stats.aborted = true;
                     stats.abortReason = res.reason || res.code;
