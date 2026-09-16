@@ -146,6 +146,7 @@ import {
   getBulkCampaignRecipients
 } from './controllers/bulkEmailController';
 import aiRoutes from './routes/aiRoutes';
+import leadIntelligenceRoutes from './routes/leadIntelligenceRoutes';
 import {
   getAISettings,
   saveGeminiKey,
@@ -162,6 +163,9 @@ import {
 
 // AI Routes
 app.use('/api/ai', authenticateToken, aiRoutes);
+
+// Lead Intelligence Module Routes (Phase 1)
+app.use('/api/lead-intelligence', leadIntelligenceRoutes);
 
 // Settings AI (BYOK Multi-Model: Gemini, OpenRouter, xKiro)
 app.get('/api/settings/ai', authenticateToken, getAISettings);

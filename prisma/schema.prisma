@@ -33,6 +33,10 @@ model User {
   aiKeys          UserAIKey[]
   aiModelPreferences AIModelPreference[]
   aiUsages        AIUsage[]
+  leadIntelligenceSources    LeadIntelligenceSource[]
+  leadIntelligenceRawRecords LeadIntelligenceRawRecord[]
+  leadIntelligenceLeads      LeadIntelligenceLead[]
+  leadIntelligenceBatches    LeadIntelligenceResearchBatch[]
 }
 
 model Workspace {
@@ -51,6 +55,9 @@ model Workspace {
   campaigns       Campaign[]
   mailboxes       Mailbox[]
   activityLogs    ActivityLog[]
+  leadIntelligenceSources LeadIntelligenceSource[]
+  leadIntelligenceLeads   LeadIntelligenceLead[]
+  leadIntelligenceBatches LeadIntelligenceResearchBatch[]
 }
 
 // ==================================================
@@ -764,4 +771,152 @@ model AIUsage {
 
   @@index([userId, requestedAt])
   @@index([provider, requestedAt])
+}
+
+// ==================================================
+// LEAD INTELLIGENCE (Phase 1)
+// ==================================================
+
+model LeadIntelligenceSource {
+  id               String    @id @default(uuid())
+  userId           String
+  workspaceId      String?
+  sourceType       String    // CSV, XLSX, PDF, PASTED_TEXT, WEBSITE
+  name             String
+  originalFileName String?
+  url              String?
+  status           String    @default("QUEUED") // QUEUED, PROCESSING, COMPLETED, PARTIAL, FAILED
+  recordCount      Int       @default(0)
+  validCount       Int       @default(0)
+  duplicateCount   Int       @default(0)
+  errorCount       Int       @default(0)
+  errorMessage     String?
+  fileSizeBytes    Int?
+  mimeType         String?
+  metadata         Json?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace        Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  rawRecords       LeadIntelligenceRawRecord[]
+  leads            LeadIntelligenceLead[]
+  batches          LeadIntelligenceResearchBatch[]
+
+  @@index([userId, createdAt])
+  @@index([workspaceId, createdAt])
+}
+
+model LeadIntelligenceResearchBatch {
+  id                String    @id @default(uuid())
+  userId            String
+  workspaceId       String?
+  name              String
+  sourceId          String?
+  sourceUrl         String?
+  status            String    @default("QUEUED") // QUEUED, DISCOVERING, EXTRACTING, NORMALIZING, DEDUPLICATING, COMPLETED, PARTIAL, FAILED, CANCELLED
+  totalPages        Int       @default(1)
+  pagesProcessed    Int       @default(0)
+  recordsDiscovered Int       @default(0)
+  recordsProcessed  Int       @default(0)
+  uniqueRecords     Int       @default(0)
+  duplicateRecords  Int       @default(0)
+  failedRecords     Int       @default(0)
+  requestCount      Int       @default(0)
+  errorMessage      String?
+  metadata          Json?
+  createdAt         DateTime  @default(now())
+  completedAt       DateTime?
+
+  user              User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace         Workspace?              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  source            LeadIntelligenceSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  leads             LeadIntelligenceLead[]
+
+  @@index([userId, createdAt])
+  @@index([workspaceId, createdAt])
+}
+
+model LeadIntelligenceRawRecord {
+  id           String    @id @default(uuid())
+  sourceId     String
+  userId       String
+  rowNumber    Int?
+  rawText      String?
+  rawData      Json?
+  parseStatus  String    @default("PARSED") // PARSED, FAILED, NEEDS_OCR
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+
+  source       LeadIntelligenceSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  leads        LeadIntelligenceLead[]
+
+  @@index([sourceId])
+  @@index([userId])
+}
+
+model LeadIntelligenceLead {
+  id                    String    @id @default(uuid())
+  userId                String
+  workspaceId           String?
+  sourceId              String
+  batchId               String?
+  rawRecordId           String?
+  
+  // Company Attributes
+  companyName           String
+  companyNormalizedName String
+  domain                String?
+  websiteUrl            String?
+  industry              String?
+  companySize           String?
+  
+  // Contact Attributes
+  contactName           String?
+  contactTitle          String?
+  email                 String?
+  phone                 String?
+  linkedinUrl           String?
+  
+  // Location
+  city                  String?
+  state                 String?
+  country               String?
+  address               String?
+  
+  // Provenance & Tracking
+  sourceType            String
+  sourceName            String
+  extractedAt           DateTime  @default(now())
+  provenance            Json?     // { sourceId, rawRecordId, fileName, rowNumber, pageNumber, extractedFields: [] }
+
+  // Status & Deduplication
+  dedupeStatus          String    @default("UNIQUE") // UNIQUE, DUPLICATE, POSSIBLE_DUPLICATE
+  duplicateConfidence   Float?    // 0.0 to 1.0
+  duplicateReason       String?   // e.g., "Exact domain match with lead #..."
+  duplicateLeadId       String?   // Reference to existing lead
+  
+  // Format / Quality
+  hasValidEmail         Boolean   @default(false)
+  hasValidPhone         Boolean   @default(false)
+  hasValidDomain        Boolean   @default(false)
+  completenessScore     Float     @default(0.0) // 0.0 to 1.0 based on field presence
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user                  User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace             Workspace?                     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  source                LeadIntelligenceSource         @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  batch                 LeadIntelligenceResearchBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  rawRecord             LeadIntelligenceRawRecord?     @relation(fields: [rawRecordId], references: [id], onDelete: SetNull)
+
+  @@index([userId, dedupeStatus])
+  @@index([workspaceId, dedupeStatus])
+  @@index([userId, companyNormalizedName])
+  @@index([userId, domain])
+  @@index([userId, email])
+  @@index([sourceId])
+  @@index([batchId])
 }

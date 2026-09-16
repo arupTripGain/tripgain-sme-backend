@@ -15,6 +15,7 @@
     "start": "node dist/src/index.js",
     "dev": "nodemon src/index.ts",
     "test": "ts-node tests/rotationService.test.ts && ts-node tests/schedulerAuth.test.ts && ts-node tests/schedulerOptimization.test.ts && ts-node tests/schedulerConcurrencyAndLocking.test.ts && ts-node tests/sequenceSubjectAndThreading.test.ts && ts-node tests/outreachAnalytics.test.ts && ts-node tests/multiUserDataIsolation.test.ts && ts-node tests/byokGeminiAi.test.ts && ts-node tests/campaignPreviewLeadResolution.test.ts && ts-node tests/businessDayScheduler.test.ts",
+    "test:lead-intel": "ts-node tests/leadIntelligence.test.ts",
     "postinstall": "prisma generate"
   },
   "keywords": [],
@@ -28,6 +29,7 @@
     "@types/mailparser": "^3.4.6",
     "@types/multer": "^2.2.0",
     "bcryptjs": "^3.0.3",
+    "cheerio": "^1.2.0",
     "cors": "^2.8.6",
     "csv-parse": "^7.0.2",
     "dotenv": "^17.4.2",
@@ -37,7 +39,10 @@
     "jsonwebtoken": "^9.0.3",
     "mailparser": "^3.9.20",
     "multer": "^2.3.0",
-    "nodemailer": "^10.0.0"
+    "nodemailer": "^10.0.0",
+    "pdf-parse": "^2.4.5",
+    "playwright": "^1.63.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -45,6 +50,7 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.4.1",
+    "@types/pdf-parse": "^1.1.5",
     "nodemon": "^3.1.14",
     "prisma": "^5.22.0",
     "ts-node": "^10.9.2",

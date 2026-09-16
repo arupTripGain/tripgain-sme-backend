@@ -45,6 +45,18 @@ export class OwnershipGuard {
     }
   }
 
+  static requireAdmin(req: Request, res: Response): AuthUser | null {
+    const user = this.requireUser(req, res);
+    if (!user) return null;
+
+    const role = (user.role || '').toUpperCase();
+    if (role !== 'ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Lead Intelligence is restricted to administrators only.' });
+      return null;
+    }
+    return user;
+  }
+
   static async assertCampaign(req: Request, res: Response, campaignId: string): Promise<Campaign | null> {
     const user = this.requireUser(req, res);
     if (!user) return null;
