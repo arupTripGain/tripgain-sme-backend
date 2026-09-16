@@ -23,9 +23,16 @@ import {
 
 const prisma = new PrismaClient();
 
-// Utility for delay calculation (configurable or fallback to 10-30 seconds for active delivery)
-function getRandomDelay(minSeconds = 15, maxAddSeconds = 15) {
-  return minSeconds + Math.floor(Math.random() * maxAddSeconds);
+// Utility for delay calculation & drip pacing
+// Formula: (3600 seconds / hourlyLimit) with human-like jitter (±15%) so emails drip evenly over the hour
+function calculatePacedDelaySeconds(hourlyLimit: number = 20, isForce: boolean = false): number {
+  if (isForce) return 5;
+  const safeLimit = Math.max(1, hourlyLimit || 20);
+  const baseIntervalSeconds = Math.floor(3600 / safeLimit);
+  // Human jitter (±15%, capped between 3 and 30 seconds)
+  const maxJitter = Math.min(30, Math.max(3, Math.floor(baseIntervalSeconds * 0.15)));
+  const jitter = Math.floor(Math.random() * (maxJitter * 2 + 1)) - maxJitter;
+  return Math.max(15, baseIntervalSeconds + jitter);
 }
 
 // ---------------------------------------------------------------------
@@ -274,6 +281,15 @@ export async function processEmailScheduler(options: {
               return { dueEnrollments: [], skipReason: 'MAILBOX_COOLDOWN' };
             }
 
+            // Calculate paced batch limit for this run tick:
+            // If options.force is true (manual force run), dispatch up to availableCapacity.
+            // If running normally, drip/pace sends evenly across the hour:
+            //   - For typical limits (<= 60/hr, e.g. 20/hr): dispatch 1 email per tick so it drips smoothly.
+            //   - For high-volume limits (> 60/hr): dispatch Math.ceil(mailbox.hourlySendLimit / 60) per tick.
+            const targetBatchSize = options.force
+              ? capacity.availableCapacity
+              : Math.min(capacity.availableCapacity, Math.max(1, Math.ceil((mailbox.hourlySendLimit || 20) / 60)));
+
             const toSend: any[] = [];
 
             // D. Priority 1: Follow-up enrollments strictly assigned to THIS mailbox (Affinity)
@@ -302,14 +318,14 @@ export async function processEmailScheduler(options: {
 
             const followUps = await tx.enrollment.findMany({
               where: followUpWhere,
-              take: capacity.availableCapacity,
+              take: targetBatchSize,
               orderBy: { nextSendAt: 'asc' }
             });
 
             toSend.push(...followUps);
 
             // E. Priority 2: If capacity remains, select NEW unassigned leads via fair least-loaded rotation
-            const remainingCapacity = capacity.availableCapacity - toSend.length;
+            const remainingCapacity = targetBatchSize - toSend.length;
             if (remainingCapacity > 0) {
               const newLeadWhere: any = {
                 campaignId: campaign.id,
@@ -350,7 +366,7 @@ export async function processEmailScheduler(options: {
               });
 
               for (const candidate of newCandidates) {
-                if (toSend.length >= capacity.availableCapacity) break;
+                if (toSend.length >= targetBatchSize) break;
 
                 const chosen = selectFairMailbox(eligibleMailboxes, countsMap, campaign.senderMailboxes);
                 if (chosen && chosen.id === mailbox.id) {
@@ -398,6 +414,11 @@ export async function processEmailScheduler(options: {
       for (const enrollment of dueEnrollments) {
         let message: any = null;
         try {
+          if (emailsSent > 0 && !options.force) {
+            // Micro pause between multiple items in a single tick to prevent burst SMTP
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+          }
+
           // 1. Lock Enrollment (clearing expired locks if any, or confirming worker reservation from Step F)
           const locked = await prisma.enrollment.updateMany({
             where: { 
@@ -940,7 +961,7 @@ export async function processEmailScheduler(options: {
             where: { sequenceId: enrollment.sequenceId, stepNumber: step.stepNumber + 1 }
           });
 
-          const delaySeconds = options.force ? 5 : getRandomDelay();
+          const delaySeconds = calculatePacedDelaySeconds(mailbox.hourlySendLimit, !!options.force);
           let nextSendTime: Date | null = null;
 
           if (nextStep) {
