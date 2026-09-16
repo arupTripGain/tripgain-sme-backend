@@ -226,8 +226,9 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
     const cleanEmail = email.trim().toLowerCase();
     // Strip any spaces from the App password (Google app passwords typically have spaces: "abcd efgh ijkl mnop")
     const cleanPassword = smtpPassword.replace(/\s+/g, '').trim();
-    const cleanSmtpUsername = (smtpUsername || cleanEmail).trim();
-    const cleanImapUsername = (imapUsername || cleanEmail).trim();
+    const cleanSmtpUsername = (smtpUsername?.trim() || cleanEmail);
+    const cleanImapUsername = (imapUsername?.trim() || cleanSmtpUsername);
+    const cleanImapPassword = imapPassword ? imapPassword.replace(/\s+/g, '').trim() : cleanPassword;
 
     const isGoogle = provider === 'GOOGLE' || smtpHost?.includes('gmail.com') || cleanEmail.endsWith('@gmail.com');
     const finalSmtpHost = isGoogle ? 'smtp.gmail.com' : (smtpHost || 'smtp.gmail.com');
@@ -256,7 +257,12 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
           user: cleanSmtpUsername,
           pass: cleanPassword
         },
-        connectionTimeout: 10000
+        connectionTimeout: 15000,
+        greetingTimeout: 8000,
+        socketTimeout: 15000,
+        tls: {
+          rejectUnauthorized: false
+        }
       });
       await transporter.verify();
     } catch (smtpErr: any) {
@@ -264,12 +270,19 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
       let userFriendlyError = 'Could not authenticate with mail server.';
       if (isGoogle) {
         userFriendlyError = 'Google authentication failed. Please make sure you are using a 16-character Google App Password (not your personal account password) and 2-Step Verification is enabled in Google.';
-      } else if (smtpErr.responseCode === 535 || smtpErr.message?.includes('Invalid login')) {
-        userFriendlyError = 'Invalid email or password. Please check your credentials.';
+      } else if (smtpErr.responseCode === 535 || smtpErr.message?.includes('Invalid login') || smtpErr.message?.includes('authentication failed')) {
+        userFriendlyError = `SMTP Authentication failed (535): Invalid username or password for user "${cleanSmtpUsername}". Please verify your SMTP Username, Password, and ensure SMTP AUTH is enabled for this mailbox.`;
+      } else if (smtpErr.code === 'ETIMEDOUT' || smtpErr.code === 'ESOCKET') {
+        userFriendlyError = `Connection to ${finalSmtpHost}:${finalSmtpPort} timed out. Please check your SMTP Host and Port.`;
+      } else if (smtpErr.code === 'ECONNREFUSED') {
+        userFriendlyError = `Connection to ${finalSmtpHost}:${finalSmtpPort} was refused. Please check if the port is correct (e.g. 587 for TLS, 465 for SSL).`;
       }
       res.status(400).json({ 
         error: userFriendlyError,
-        technicalDetails: smtpErr.message 
+        technicalDetails: smtpErr.message,
+        testedUser: cleanSmtpUsername,
+        testedHost: finalSmtpHost,
+        testedPort: finalSmtpPort
       });
       return;
     }
@@ -318,7 +331,7 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
         encryptedImapHost: encrypt(finalImapHost),
         encryptedImapPort: encrypt(String(finalImapPort)),
         encryptedImapUsername: encrypt(cleanImapUsername),
-        encryptedImapPassword: encrypt(cleanPassword),
+        encryptedImapPassword: encrypt(cleanImapPassword),
       },
       create: {
         mailboxId: mailbox.id,
@@ -329,7 +342,7 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
         encryptedImapHost: encrypt(finalImapHost),
         encryptedImapPort: encrypt(String(finalImapPort)),
         encryptedImapUsername: encrypt(cleanImapUsername),
-        encryptedImapPassword: encrypt(cleanPassword),
+        encryptedImapPassword: encrypt(cleanImapPassword),
       }
     });
 
