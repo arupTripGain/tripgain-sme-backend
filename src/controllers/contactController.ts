@@ -199,54 +199,174 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
     if (!user) return;
 
     const { contacts, listId, newListName } = req.body;
+    
+    if (!Array.isArray(contacts) || contacts.length === 0) {
+      res.status(200).json({
+        total: 0,
+        new: 0,
+        updated: 0,
+        duplicates: 0,
+        invalid: 0,
+        listId: listId || null
+      });
+      return;
+    }
+
     const workspace = await getWorkspace();
     
-    let targetListId = listId;
+    let targetListId = listId || null;
     
-    // Create new list if requested
-    if (newListName && !targetListId) {
-      const newList = await prisma.list.create({
-        data: {
+    // Create new list if requested or find existing by same name to avoid duplicates
+    if (newListName && typeof newListName === 'string' && newListName.trim() && !targetListId) {
+      const trimmedListName = newListName.trim();
+      const existingList = await prisma.list.findFirst({
+        where: {
           workspaceId: workspace.id,
           userId: user.userId,
-          name: newListName,
-          listType: 'static'
+          name: trimmedListName
         }
       });
-      targetListId = newList.id;
+
+      if (existingList) {
+        targetListId = existingList.id;
+      } else {
+        const newList = await prisma.list.create({
+          data: {
+            workspaceId: workspace.id,
+            userId: user.userId,
+            name: trimmedListName,
+            listType: 'static'
+          }
+        });
+        targetListId = newList.id;
+      }
     }
     
-    let stats = {
+    const stats = {
       total: contacts.length,
       new: 0,
       updated: 0,
       duplicates: 0,
-      invalid: 0
+      invalid: 0,
+      listId: targetListId
     };
-    
-    // For large imports in production, use prisma.$transaction or a message queue.
-    // For this prototype, we'll process sequentially.
+
+    // Step 1: Pre-process and validate email formats & deduplicate within this request batch
+    interface ValidRowItem {
+      cleanEmail: string;
+      cleanDomain: string | null;
+      companyName: string | null;
+      raw: any;
+    }
+
+    const validItems: ValidRowItem[] = [];
+    const seenEmailsInBatch = new Set<string>();
+
     for (const row of contacts) {
-      const email = row.email?.trim()?.toLowerCase();
-      
-      if (!email || !email.includes('@')) {
+      if (!row || typeof row !== 'object') {
         stats.invalid++;
         continue;
       }
+
+      const rawEmail = typeof row.email === 'string' ? row.email.trim() : '';
+      const email = rawEmail.toLowerCase();
       
-      // 1. Organization mapping
-      let orgId = null;
-      let domain = row.domain?.trim()?.toLowerCase();
-      const companyName = row.companyName?.trim();
-      
+      // Basic email syntax validation
+      if (!email || !email.includes('@') || !email.includes('.') || email.length > 254) {
+        stats.invalid++;
+        continue;
+      }
+
+      // Deduplicate duplicate rows inside the same CSV file
+      if (seenEmailsInBatch.has(email)) {
+        stats.duplicates++;
+        continue;
+      }
+      seenEmailsInBatch.add(email);
+
+      // Clean domain
+      let domain = typeof row.domain === 'string' ? row.domain.trim().toLowerCase() : '';
+      if (domain) {
+        domain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].trim();
+      }
       if (!domain && email) {
         const parts = email.split('@');
-        if (parts.length === 2 && !['gmail.com', 'yahoo.com', 'hotmail.com'].includes(parts[1])) {
+        if (parts.length === 2 && !['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'rediffmail.com'].includes(parts[1])) {
           domain = parts[1];
         }
       }
-      
-      if (domain || companyName) {
+
+      const companyName = typeof row.companyName === 'string' && row.companyName.trim() ? row.companyName.trim() : null;
+
+      validItems.push({
+        cleanEmail: email,
+        cleanDomain: domain || null,
+        companyName,
+        raw: row
+      });
+    }
+
+    if (validItems.length === 0) {
+      res.status(200).json(stats);
+      return;
+    }
+
+    // Step 2: Batch query existing contacts for this user across all valid emails
+    const existingContactEmails = await prisma.contactEmail.findMany({
+      where: {
+        normalizedEmail: { in: validItems.map(item => item.cleanEmail) },
+        contact: { userId: user.userId }
+      },
+      select: {
+        normalizedEmail: true,
+        contactId: true
+      }
+    });
+
+    const existingEmailToContactId = new Map<string, string>();
+    for (const item of existingContactEmails) {
+      existingEmailToContactId.set(item.normalizedEmail, item.contactId);
+    }
+
+    // Step 3: Batch query existing list memberships if target list is specified
+    const existingMemberContactIds = new Set<string>();
+    if (targetListId) {
+      const existingMembers = await prisma.listMember.findMany({
+        where: { listId: targetListId },
+        select: { contactId: true }
+      });
+      for (const m of existingMembers) {
+        existingMemberContactIds.add(m.contactId);
+      }
+    }
+
+    // Step 4: Batch pre-fetch organizations by domain to avoid redundant queries
+    const uniqueDomains = Array.from(new Set(validItems.map(i => i.cleanDomain).filter(Boolean))) as string[];
+    const domainToOrgId = new Map<string, string>();
+
+    if (uniqueDomains.length > 0) {
+      const existingOrgs = await prisma.organization.findMany({
+        where: {
+          workspaceId: workspace.id,
+          domain: { in: uniqueDomains }
+        },
+        select: { id: true, domain: true }
+      });
+      for (const org of existingOrgs) {
+        if (org.domain) {
+          domainToOrgId.set(org.domain.toLowerCase(), org.id);
+        }
+      }
+    }
+
+    // Safe helper to resolve or create organization without breaking contact import
+    const getOrCreateOrg = async (domain: string | null, companyName: string | null, row: any): Promise<string | null> => {
+      if (!domain && !companyName) return null;
+      if (domain && domainToOrgId.has(domain)) {
+        return domainToOrgId.get(domain)!;
+      }
+
+      try {
         let organization = null;
         if (domain) {
           organization = await prisma.organization.findUnique({
@@ -254,6 +374,12 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
           });
         }
         
+        if (!organization && companyName) {
+          organization = await prisma.organization.findFirst({
+            where: { workspaceId: workspace.id, name: companyName }
+          });
+        }
+
         if (!organization) {
           organization = await prisma.organization.create({
             data: {
@@ -266,82 +392,94 @@ export const bulkImportContacts = async (req: Request, res: Response): Promise<v
             }
           });
         }
-        orgId = organization.id;
+
+        if (domain && organization?.id) {
+          domainToOrgId.set(domain, organization.id);
+        }
+        return organization?.id || null;
+      } catch (orgError) {
+        console.warn('Organization resolution error (skipped org mapping):', orgError);
+        return null;
       }
-      
-      // 2. Check existing contact via Email strictly for this user
-      const existingEmail = await prisma.contactEmail.findFirst({
-        where: { 
-          normalizedEmail: email,
-          contact: { userId: user.userId }
-        },
-        include: { contact: true }
-      });
-      
-      let contactId = null;
-      
-      if (existingEmail) {
-        contactId = existingEmail.contactId;
-        
-        // Check if already in list
-        if (targetListId) {
-          const existingMember = await prisma.listMember.findUnique({
-            where: { listId_contactId: { listId: targetListId, contactId } }
-          });
-          
-          if (existingMember) {
-            stats.duplicates++;
+    };
+
+    // Step 5: Process contacts with per-row error isolation
+    for (const item of validItems) {
+      try {
+        const { cleanEmail, cleanDomain, companyName, raw } = item;
+        const existingContactId = existingEmailToContactId.get(cleanEmail);
+
+        if (existingContactId) {
+          if (targetListId) {
+            if (existingMemberContactIds.has(existingContactId)) {
+              stats.duplicates++;
+            } else {
+              await prisma.listMember.create({
+                data: { listId: targetListId, contactId: existingContactId }
+              }).catch(err => {
+                // If concurrent import created the membership, ignore unique collision
+                console.warn('ListMember create notice:', err?.message);
+              });
+              existingMemberContactIds.add(existingContactId);
+              stats.updated++;
+            }
           } else {
-            // Add to list
-            await prisma.listMember.create({
-              data: { listId: targetListId, contactId }
-            });
-            stats.updated++;
+            stats.duplicates++;
           }
         } else {
-          stats.duplicates++;
-        }
-        
-      } else {
-        // Create new contact scoped to user.userId
-        const newContact = await prisma.contact.create({
-          data: {
-            workspaceId: workspace.id,
-            userId: user.userId,
-            organizationId: orgId,
-            firstName: row.firstName || null,
-            lastName: row.lastName || null,
-            fullName: `${row.firstName || ''} ${row.lastName || ''}`.trim() || null,
-            jobTitle: row.jobTitle || null,
-            linkedinUrl: row.linkedinUrl || null,
-            city: row.city || null,
-            personalizedLine: row.personalizedLine || null,
-            personalizationTrigger: row.personalizationTrigger || null,
-            emails: {
-              create: [{
-                email: row.email,
-                normalizedEmail: email,
-                isPrimary: true
-              }]
+          // Resolve organization safely
+          const orgId = await getOrCreateOrg(cleanDomain, companyName, raw);
+
+          const firstName = typeof raw.firstName === 'string' ? raw.firstName.trim() : '';
+          const lastName = typeof raw.lastName === 'string' ? raw.lastName.trim() : '';
+          const fullName = `${firstName} ${lastName}`.trim() || null;
+
+          const newContact = await prisma.contact.create({
+            data: {
+              workspaceId: workspace.id,
+              userId: user.userId,
+              organizationId: orgId,
+              firstName: firstName || null,
+              lastName: lastName || null,
+              fullName,
+              jobTitle: raw.jobTitle || null,
+              linkedinUrl: raw.linkedinUrl || null,
+              city: raw.city || null,
+              personalizedLine: raw.personalizedLine || null,
+              personalizationTrigger: raw.personalizationTrigger || null,
+              emails: {
+                create: [{
+                  email: raw.email?.trim() || cleanEmail,
+                  normalizedEmail: cleanEmail,
+                  isPrimary: true
+                }]
+              }
             }
-          }
-        });
-        
-        contactId = newContact.id;
-        stats.new++;
-        
-        if (targetListId) {
-          await prisma.listMember.create({
-            data: { listId: targetListId, contactId }
           });
+
+          const newContactId = newContact.id;
+          existingEmailToContactId.set(cleanEmail, newContactId);
+          stats.new++;
+
+          if (targetListId) {
+            await prisma.listMember.create({
+              data: { listId: targetListId, contactId: newContactId }
+            }).catch(err => {
+              console.warn('ListMember create notice:', err?.message);
+            });
+            existingMemberContactIds.add(newContactId);
+          }
         }
+      } catch (rowError) {
+        console.error('Error importing single contact row:', rowError);
+        stats.invalid++;
       }
     }
     
     res.status(200).json(stats);
-  } catch (error) {
-    console.error('Bulk import error:', error);
-    res.status(500).json({ error: 'Failed to import contacts' });
+  } catch (error: any) {
+    console.error('Bulk import fatal error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to import contacts' });
   }
 };
 
