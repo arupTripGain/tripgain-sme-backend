@@ -80,9 +80,27 @@ function validateLeadContext(data: Record<string, any>): { isValid: boolean; war
 }
 
 // Mirror of renderTemplate from templateEngine.ts
-function renderTemplate(templateStr: string, data: Record<string, any>): string {
+function renderTemplate(templateStr: string, data: Record<string, any>, highlightVariables = false): string {
   if (!templateStr) return '';
-  const template = Handlebars.compile(templateStr, { noEscape: true });
+  const instance = Handlebars.create();
+
+  instance.registerHelper('helperMissing', function (...args: any[]) {
+    const options = args[args.length - 1];
+    const key = options?.name || '';
+    const config = VARIABLE_REGISTRY[key];
+
+    if (highlightVariables) {
+      return new instance.SafeString(
+        `<span class="bg-red-100 text-red-800 px-1 rounded mx-0.5 font-bold" title="Missing variable ${key}">[MISSING ${key}]</span>`
+      );
+    }
+
+    if (config?.fallback) {
+      return config.fallback;
+    }
+    return '';
+  });
+
   const processedData: Record<string, any> = {};
 
   for (const key of Object.keys(VARIABLE_REGISTRY)) {
@@ -94,17 +112,28 @@ function renderTemplate(templateStr: string, data: Record<string, any>): string 
     }
 
     const isMissing = rawVal === undefined || rawVal === null || rawVal.toString().trim() === '';
-    processedData[key] = isMissing ? '' : rawVal;
+    if (!isMissing) {
+      processedData[key] = highlightVariables
+        ? new instance.SafeString(`<span class="bg-blue-100 text-blue-800 px-1 rounded mx-0.5 whitespace-pre-wrap" title="${key}">${rawVal}</span>`)
+        : rawVal;
+    }
   }
 
   for (const key of Object.keys(data)) {
     if (!processedData.hasOwnProperty(key)) {
       const rawVal = data[key];
-      processedData[key] = rawVal === undefined || rawVal === null ? '' : rawVal;
+      const isMissing = rawVal === undefined || rawVal === null || rawVal.toString().trim() === '';
+      if (!isMissing) {
+        processedData[key] = highlightVariables
+          ? new instance.SafeString(`<span class="bg-blue-100 text-blue-800 px-1 rounded mx-0.5 whitespace-pre-wrap" title="${key}">${rawVal}</span>`)
+          : rawVal;
+      }
     }
   }
 
+  const template = instance.compile(templateStr, { noEscape: true });
   let output = template(processedData);
+  output = output.replace(/<p>\s*(?:<br\s*\/?>|&nbsp;|\s)*<\/p>/gi, '');
   output = output.replace(/ {2,}/g, ' ');
   output = output.replace(/ ,/g, ',');
   output = output.replace(/ \./g, '.');
