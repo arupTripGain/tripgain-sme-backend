@@ -1,7 +1,5 @@
 import { parse as csvParse } from 'csv-parse/sync';
 import * as XLSX from 'xlsx';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require('pdf-parse');
 import { fetchPublicUrl, FetchedWebContent } from './urlFetcherService';
 import { classifyPage } from './pageClassifier';
 import { extractFromDirectory, parseDetailPageHtml, mapJsonRecordToLead } from './directoryExtractor';
@@ -411,6 +409,8 @@ export async function extractFromPdf(
 ): Promise<ExtractionResult> {
   let data: any;
   try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const pdfParse = require('pdf-parse');
     data = await pdfParse(buffer);
   } catch (err: any) {
     return {
