@@ -37,6 +37,7 @@ model User {
   leadIntelligenceRawRecords LeadIntelligenceRawRecord[]
   leadIntelligenceLeads      LeadIntelligenceLead[]
   leadIntelligenceBatches    LeadIntelligenceResearchBatch[]
+  emailVerificationJobs      EmailVerificationJob[]
 }
 
 model Workspace {
@@ -140,6 +141,7 @@ model Contact {
   emailEvents     EmailEvent[]
   conversations   Conversation[]
   conversationActions ConversationAction[]
+  verificationResults EmailVerificationResult[]
 
   @@index([userId])
   @@index([userId, createdAt])
@@ -159,6 +161,7 @@ model ContactEmail {
   createdAt          DateTime @default(now())
 
   contact Contact @relation(fields: [contactId], references: [id])
+  verificationResults EmailVerificationResult[]
   
   @@unique([contactId, normalizedEmail])
 }
@@ -182,6 +185,7 @@ model List {
   user      User?     @relation(fields: [userId], references: [id])
   members   ListMember[]
   campaigns Campaign[]
+  verificationJobs EmailVerificationJob[]
 
   @@index([userId])
 }
@@ -919,4 +923,80 @@ model LeadIntelligenceLead {
   @@index([userId, email])
   @@index([sourceId])
   @@index([batchId])
+}
+
+// ==================================================
+// LISTGUARD — EMAIL VERIFICATION & HYGIENE
+// ==================================================
+
+model EmailVerificationJob {
+  id              String    @id @default(uuid())
+  listId          String
+  createdByUserId String
+  status          String    @default("QUEUED") // QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
+
+  total           Int       @default(0)
+  processed       Int       @default(0)
+  deliverable     Int       @default(0)
+  undeliverable   Int       @default(0)
+  catchAll        Int       @default(0)
+  unknown         Int       @default(0)
+  reusedFromCache Int       @default(0)
+
+  error           String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  list            List      @relation(fields: [listId], references: [id], onDelete: Cascade)
+  user            User      @relation(fields: [createdByUserId], references: [id], onDelete: Cascade)
+  results         EmailVerificationResult[]
+
+  @@index([createdByUserId, listId])
+  @@index([createdByUserId, createdAt])
+  @@index([listId, createdAt])
+}
+
+model EmailVerificationResult {
+  id                 String   @id @default(uuid())
+  jobId              String
+  contactId          String?
+  contactEmailId     String?
+
+  email              String
+  normalizedEmail    String
+
+  result             String   // DELIVERABLE, UNDELIVERABLE, CATCH_ALL, UNKNOWN
+  verificationReason String?  // VALID_MAILBOX, INVALID_MAILBOX, NO_MX, INVALID_SYNTAX, CATCH_ALL_DOMAIN, DISPOSABLE_DOMAIN, ROLE_ADDRESS, SUPPRESSED, HARD_BOUNCED, GREYLISTED, SMTP_TIMEOUT, SMTP_BLOCKED, UNKNOWN
+
+  syntaxStatus       String   // PASS, FAIL
+  domainStatus       String   // PASS, FAIL, UNKNOWN
+  mxStatus           String   // PASS, FAIL, UNKNOWN
+  smtpStatus         String   // DELIVERABLE_SIGNAL, UNDELIVERABLE_SIGNAL, TEMPORARY_FAILURE, GREYLISTED, CATCH_ALL, UNKNOWN
+
+  isCatchAll         Boolean  @default(false)
+  isDisposable       Boolean  @default(false)
+  isRole             Boolean  @default(false)
+
+  suppressionStatus  String?  // NONE, SUPPRESSED, UNSUBSCRIBED, DO_NOT_CONTACT, HARD_BOUNCED
+  bounceStatus       String?  // NONE, HARD_BOUNCE, SOFT_BOUNCE
+
+  smtpResponseCode   String?
+  smtpResponse       String?
+
+  verifiedAt         DateTime @default(now())
+  expiresAt          DateTime
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  job                EmailVerificationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  contact            Contact?             @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  contactEmail       ContactEmail?        @relation(fields: [contactEmailId], references: [id], onDelete: SetNull)
+
+  @@index([jobId, result])
+  @@index([normalizedEmail, expiresAt])
+  @@index([contactId])
 }
