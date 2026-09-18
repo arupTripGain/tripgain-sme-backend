@@ -108,62 +108,6 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
     return { success: false, syncedCount: 0, newConversations: 0, error: 'IMAP password not available' };
   }
 
-  // 1. Gather all TripGain Outbound Messages & Outreach Prospects
-  const outboundMessages = await prisma.conversationMessage.findMany({
-    where: { direction: 'OUTBOUND' },
-    select: {
-      conversationId: true,
-      internetMessageId: true,
-      providerMessageId: true,
-      recipientEmails: true,
-      subject: true
-    }
-  });
-
-  // Map Message-IDs to their parent TripGain conversation
-  const outboundIdsToConversation = new Map<string, string>();
-  const outreachRecipientsToConversation = new Map<string, string>();
-
-  for (const msg of outboundMessages) {
-    if (msg.internetMessageId) {
-      outboundIdsToConversation.set(cleanHeaderId(msg.internetMessageId), msg.conversationId);
-    }
-    if (msg.providerMessageId) {
-      outboundIdsToConversation.set(cleanHeaderId(msg.providerMessageId), msg.conversationId);
-    }
-    const recs = Array.isArray(msg.recipientEmails) ? msg.recipientEmails : [];
-    for (const r of recs) {
-      if (typeof r === 'string' && r.includes('@')) {
-        outreachRecipientsToConversation.set(r.trim().toLowerCase(), msg.conversationId);
-      }
-    }
-  }
-
-  // Also gather contacts actively enrolled in TripGain campaigns
-  const enrolledContacts = await prisma.enrollment.findMany({
-    select: {
-      id: true,
-      campaignId: true,
-      sequenceId: true,
-      contact: {
-        include: {
-          emails: true,
-          organization: true,
-          conversations: true
-        }
-      }
-    }
-  });
-
-  const enrolledEmailsMap = new Map<string, any>();
-  for (const enr of enrolledContacts) {
-    for (const em of enr.contact?.emails || []) {
-      if (em.normalizedEmail) {
-        enrolledEmailsMap.set(em.normalizedEmail.toLowerCase(), enr);
-      }
-    }
-  }
-
   const client = new ImapFlow({
     host: imapHost,
     port: imapPort,
@@ -218,13 +162,17 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
           // ========================================================
           // 1. BOUNCE PROCESSING (Hard bounce vs Soft bounce vs Unknown)
           // ========================================================
-          const knownEmails = Array.from(enrolledEmailsMap.keys());
-          const bounceInfo = classifyBounce(senderEmail, subject, bodyText, knownEmails);
+          const bounceInfo = classifyBounce(senderEmail, subject, bodyText);
 
           if (bounceInfo.isBounce && bounceInfo.targetEmail) {
             const targetNorm = bounceInfo.targetEmail.toLowerCase();
-            const enrolledData = enrolledEmailsMap.get(targetNorm);
-            const contactId = enrolledData?.contact?.id;
+            
+            // Targeted lookup for bounced contact email & contact
+            const targetContactEmail = await prisma.contactEmail.findFirst({
+              where: { normalizedEmail: targetNorm },
+              select: { id: true, contactId: true }
+            });
+            const contactId = targetContactEmail?.contactId;
 
             const emailMessage = await prisma.emailMessage.findFirst({
               where: {
@@ -342,11 +290,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                 });
 
                 await prisma.contactEmail.updateMany({
-                  where: { contactId, normalizedEmail: targetNorm },
-                  data: {
-                    verificationStatus: 'soft_bounced',
-                    lastBouncedAt: receivedDate
-                  }
+                  where: { normalizedEmail: targetNorm },
+                  data: { verificationStatus: 'soft_bounced', bounceCount: { increment: 1 }, lastBouncedAt: receivedDate }
                 });
               }
 
@@ -400,34 +345,103 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
           // STRICT FILTER: IS THIS A REPLY TO A TRIPGAIN EMAIL?
           // ========================================================
           const inReplyToClean = cleanHeaderId(inReplyTo);
-          const references = Array.isArray(parsed.references)
-            ? parsed.references.map(cleanHeaderId)
-            : [cleanHeaderId(parsed.references)];
+          const references = (Array.isArray(parsed.references) ? parsed.references : [parsed.references])
+            .map(cleanHeaderId)
+            .filter((r): r is string => Boolean(r && r.length > 0));
 
-          let matchedConvId = outboundIdsToConversation.get(inReplyToClean);
-          if (!matchedConvId) {
-            for (const ref of references) {
-              if (ref && outboundIdsToConversation.has(ref)) {
-                matchedConvId = outboundIdsToConversation.get(ref);
-                break;
+          const headerCandidateIds = Array.from(new Set([
+            ...(inReplyToClean ? [inReplyToClean] : []),
+            ...references
+          ]));
+
+          let matchedConvId: string | null = null;
+
+          // 1. Thread matching by In-Reply-To or References header IDs
+          if (headerCandidateIds.length > 0) {
+            const matchedOutboundMsg = await prisma.conversationMessage.findFirst({
+              where: {
+                direction: 'OUTBOUND',
+                OR: [
+                  { internetMessageId: { in: headerCandidateIds } },
+                  { providerMessageId: { in: headerCandidateIds } }
+                ]
+              },
+              select: {
+                id: true,
+                conversationId: true,
+                internetMessageId: true,
+                providerMessageId: true
               }
+            });
+
+            if (matchedOutboundMsg?.conversationId) {
+              matchedConvId = matchedOutboundMsg.conversationId;
             }
           }
 
-          // If no direct Message-ID match, check if sender is a prospect we contacted
-          if (!matchedConvId && outreachRecipientsToConversation.has(senderEmail)) {
-            matchedConvId = outreachRecipientsToConversation.get(senderEmail);
-          }
+          // 2. Targeted lookup: resolve contact by sender email
+          const senderNorm = senderEmail.trim().toLowerCase();
+          const matchedContactEmail = await prisma.contactEmail.findFirst({
+            where: { normalizedEmail: senderNorm },
+            select: {
+              id: true,
+              contactId: true,
+              contact: {
+                select: {
+                  id: true,
+                  organizationId: true
+                }
+              }
+            }
+          });
 
-          let matchedEnrollment = null;
-          let matchedContact = null;
+          const matchedContact = matchedContactEmail?.contact || null;
 
-          if (!matchedConvId && enrolledEmailsMap.has(senderEmail)) {
-            const enrData = enrolledEmailsMap.get(senderEmail);
-            matchedEnrollment = enrData;
-            matchedContact = enrData.contact;
-            if (enrData.contact?.conversations?.[0]?.id) {
-              matchedConvId = enrData.contact.conversations[0].id;
+          // 3. Resolve active or recent enrollment for this contact
+          let matchedEnrollment: {
+            id: string;
+            campaignId: string;
+            sequenceId: string;
+          } | null = null;
+
+          if (matchedContact) {
+            matchedEnrollment = await prisma.enrollment.findFirst({
+              where: {
+                contactId: matchedContact.id,
+                status: { in: ['active', 'pending', 'sending', 'replied'] }
+              },
+              select: {
+                id: true,
+                campaignId: true,
+                sequenceId: true
+              },
+              orderBy: { createdAt: 'desc' }
+            });
+
+            // 4. If conversation not matched by headers, check existing conversation for this contact
+            if (!matchedConvId) {
+              const existingContactConv = await prisma.conversation.findFirst({
+                where: {
+                  contactId: matchedContact.id,
+                  mailboxId: mailbox.id
+                },
+                select: { id: true },
+                orderBy: { latestMessageAt: 'desc' }
+              });
+
+              if (existingContactConv?.id) {
+                matchedConvId = existingContactConv.id;
+              } else {
+                // Check across all mailboxes for fallback conversation
+                const globalContactConv = await prisma.conversation.findFirst({
+                  where: { contactId: matchedContact.id },
+                  select: { id: true },
+                  orderBy: { latestMessageAt: 'desc' }
+                });
+                if (globalContactConv?.id) {
+                  matchedConvId = globalContactConv.id;
+                }
+              }
             }
           }
 
@@ -586,6 +600,15 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
 
     await client.logout();
 
+    await prisma.mailbox.update({
+      where: { id: mailbox.id },
+      data: {
+        lastReplySyncAt: new Date(),
+        replySyncStatus: 'ACTIVE',
+        lastError: null
+      }
+    }).catch(() => {});
+
     return {
       success: true,
       syncedCount,
@@ -594,6 +617,15 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
     };
   } catch (err: any) {
     console.error('Outreach IMAP sync error:', err);
+    await prisma.mailbox.update({
+      where: { id: mailbox.id },
+      data: {
+        lastReplySyncAt: new Date(),
+        replySyncStatus: 'ERROR',
+        lastError: (err?.message || 'IMAP sync failure').slice(0, 255)
+      }
+    }).catch(() => {});
+
     return {
       success: false,
       syncedCount,
@@ -602,3 +634,96 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
     };
   }
 }
+
+export interface InboundSyncSummary {
+  mailboxesChecked: number;
+  repliesSynced: number;
+  newConversations: number;
+  mailboxErrors: number;
+  details: Array<{
+    mailboxId: string;
+    email: string;
+    syncedCount: number;
+    success: boolean;
+    error?: string;
+  }>;
+}
+
+/**
+ * Periodically synchronizes inbound replies across all active connected mailboxes.
+ * Uses bounded sequential processing to prevent IMAP connection floods and avoid Vercel timeouts.
+ */
+export async function syncAllActiveMailboxes(): Promise<InboundSyncSummary> {
+  console.log('[Inbound Sync] Starting mailbox sync');
+
+  const activeMailboxes = await prisma.mailbox.findMany({
+    where: {
+      status: 'CONNECTED',
+      isActive: true,
+      credentials: {
+        encryptedImapPassword: { not: null }
+      }
+    },
+    select: {
+      id: true,
+      email: true
+    },
+    orderBy: {
+      lastReplySyncAt: 'asc' // Least recently synced first
+    }
+  });
+
+  const summary: InboundSyncSummary = {
+    mailboxesChecked: activeMailboxes.length,
+    repliesSynced: 0,
+    newConversations: 0,
+    mailboxErrors: 0,
+    details: []
+  };
+
+  if (activeMailboxes.length === 0) {
+    console.log('[Inbound Sync] No active connected mailboxes with IMAP credentials found.');
+    return summary;
+  }
+
+  for (const mb of activeMailboxes) {
+    try {
+      const res = await syncMailboxReplies(mb.id);
+      if (res.success) {
+        summary.repliesSynced += res.syncedCount;
+        summary.newConversations += res.newConversations;
+        console.log(`[Inbound Sync] Mailbox ${mb.email} synced ${res.syncedCount} replies`);
+        summary.details.push({
+          mailboxId: mb.id,
+          email: mb.email,
+          syncedCount: res.syncedCount,
+          success: true
+        });
+      } else {
+        summary.mailboxErrors++;
+        console.warn(`[Inbound Sync] Mailbox sync failed for ${mb.email}: ${res.error || 'Unknown error'}`);
+        summary.details.push({
+          mailboxId: mb.id,
+          email: mb.email,
+          syncedCount: 0,
+          success: false,
+          error: res.error || 'Sync failed'
+        });
+      }
+    } catch (err: any) {
+      summary.mailboxErrors++;
+      console.error(`[Inbound Sync] Mailbox sync failed for ${mb.email}: ${err?.message || 'Unknown error'}`);
+      summary.details.push({
+        mailboxId: mb.id,
+        email: mb.email,
+        syncedCount: 0,
+        success: false,
+        error: err?.message || 'Sync error'
+      });
+    }
+  }
+
+  console.log(`[Inbound Sync] Completed. Checked: ${summary.mailboxesChecked}, Synced: ${summary.repliesSynced} replies, Errors: ${summary.mailboxErrors}`);
+  return summary;
+}
+
