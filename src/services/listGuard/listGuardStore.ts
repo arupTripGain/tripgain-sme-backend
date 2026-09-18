@@ -16,6 +16,9 @@ export interface VerificationJobData {
   error?: string | null;
   startedAt?: Date | null;
   completedAt?: Date | null;
+  lockedBy?: string | null;
+  lockedAt?: Date | null;
+  lockExpiresAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -29,6 +32,7 @@ export interface VerificationResultData {
   normalizedEmail: string;
   result: 'DELIVERABLE' | 'UNDELIVERABLE' | 'CATCH_ALL' | 'UNKNOWN';
   verificationReason?: string | null;
+  confidence?: 'HIGH' | 'MEDIUM' | 'LOW' | null;
   syntaxStatus: string;
   domainStatus: string;
   mxStatus: string;
@@ -64,14 +68,16 @@ export class ListGuardStore {
     try {
       await (prisma as any).emailVerificationJob.findFirst({ take: 1 });
       this.dbHasTables = true;
-    } catch (err) {
+      return true;
+    } catch (err: any) {
       if (this.isTableMissingError(err)) {
         this.dbHasTables = false;
-      } else {
-        this.dbHasTables = false;
+        return false;
       }
+      // If error is connection or auth failure, do NOT cache dbHasTables as false
+      console.warn('[ListGuardStore] Database table check encountered connectivity error:', err?.message);
+      throw err;
     }
-    return this.dbHasTables;
   }
 
   // --- JOB METHODS ---
@@ -119,7 +125,6 @@ export class ListGuardStore {
       }
     }
 
-    // In-memory fallback
     const id = crypto.randomUUID();
     const now = new Date();
     const job: VerificationJobData = {
@@ -146,26 +151,64 @@ export class ListGuardStore {
   public static async updateJob(
     prisma: PrismaClient,
     jobId: string,
-    data: Partial<VerificationJobData>
-  ): Promise<void> {
+    data: Partial<{
+      status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+      total: number;
+      processed: number;
+      deliverable: number;
+      undeliverable: number;
+      catchAll: number;
+      unknown: number;
+      reusedFromCache: number;
+      error: string | null;
+      startedAt: Date | null;
+      completedAt: Date | null;
+      lockedBy: string | null;
+      lockedAt: Date | null;
+      lockExpiresAt: Date | null;
+    }>
+  ): Promise<VerificationJobData | null> {
+    // Guard: Never overwrite CANCELLED status with RUNNING or COMPLETED
+    if (data.status && data.status !== 'CANCELLED') {
+      const current = await this.findJobById(prisma, jobId);
+      if (current?.status === 'CANCELLED') {
+        delete data.status;
+      }
+    }
+
     const hasTables = await this.checkTableAvailability(prisma);
     if (hasTables) {
       try {
-        await (prisma as any).emailVerificationJob.update({
+        const dbJob = await (prisma as any).emailVerificationJob.update({
           where: { id: jobId },
           data
         });
-        return;
-      } catch (err) {
+        return dbJob;
+      } catch (err: any) {
+        // If column doesn't exist (e.g. lockedBy on unmigrated db), retry without lock fields
+        if (data.lockedBy !== undefined || data.lockExpiresAt !== undefined) {
+          try {
+            const sanitized = { ...data };
+            delete sanitized.lockedBy;
+            delete sanitized.lockedAt;
+            delete sanitized.lockExpiresAt;
+            const fallbackJob = await (prisma as any).emailVerificationJob.update({
+              where: { id: jobId },
+              data: sanitized
+            });
+            return fallbackJob;
+          } catch {}
+        }
         if (!this.isTableMissingError(err)) throw err;
         this.dbHasTables = false;
       }
     }
 
     const job = this.jobsMap.get(jobId);
-    if (job) {
-      Object.assign(job, data, { updatedAt: new Date() });
-    }
+    if (!job) return null;
+
+    Object.assign(job, data, { updatedAt: new Date() });
+    return job;
   }
 
   public static async findJobById(
@@ -181,7 +224,7 @@ export class ListGuardStore {
         const dbJob = await (prisma as any).emailVerificationJob.findFirst({
           where: whereClause
         });
-        if (dbJob) return dbJob;
+        return dbJob;
       } catch (err) {
         if (!this.isTableMissingError(err)) throw err;
         this.dbHasTables = false;
@@ -227,6 +270,104 @@ export class ListGuardStore {
     return jobs[0] || null;
   }
 
+  /**
+   * Atomically claims the next pending verification job for a worker.
+   * Looks for status 'QUEUED' or abandoned 'RUNNING' jobs where lock has expired.
+   */
+  public static async claimNextJob(
+    prisma: PrismaClient,
+    workerId: string,
+    leaseDurationMs: number = 5 * 60 * 1000
+  ): Promise<VerificationJobData | null> {
+    const now = new Date();
+    const lockExpiresAt = new Date(now.getTime() + leaseDurationMs);
+
+    const hasTables = await this.checkTableAvailability(prisma);
+    if (hasTables) {
+      try {
+        // First look for QUEUED jobs
+        let candidate = await (prisma as any).emailVerificationJob.findFirst({
+          where: { status: 'QUEUED' },
+          orderBy: { createdAt: 'asc' }
+        });
+
+        // If no QUEUED job, check for abandoned RUNNING jobs whose lock expired (stale updatedAt)
+        if (!candidate) {
+          const staleCutoff = new Date(now.getTime() - leaseDurationMs);
+          candidate = await (prisma as any).emailVerificationJob.findFirst({
+            where: {
+              status: 'RUNNING',
+              updatedAt: { lt: staleCutoff }
+            },
+            orderBy: { createdAt: 'asc' }
+          });
+        }
+
+        if (candidate) {
+          const updated = await this.updateJob(prisma, candidate.id, {
+            status: 'RUNNING',
+            lockedBy: workerId,
+            lockedAt: now,
+            lockExpiresAt,
+            startedAt: candidate.startedAt || now
+          });
+          return updated;
+        }
+      } catch (err) {
+        if (!this.isTableMissingError(err)) throw err;
+        this.dbHasTables = false;
+      }
+    }
+
+    // In-memory queue fallback
+    for (const job of this.jobsMap.values()) {
+      if (
+        job.status === 'QUEUED' ||
+        (job.status === 'RUNNING' && job.lockExpiresAt && job.lockExpiresAt.getTime() < now.getTime())
+      ) {
+        job.status = 'RUNNING';
+        job.lockedBy = workerId;
+        job.lockedAt = now;
+        job.lockExpiresAt = lockExpiresAt;
+        if (!job.startedAt) job.startedAt = now;
+        job.updatedAt = now;
+        return job;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Renews lock lease on an active job to prevent expiration during long-running tasks.
+   */
+  public static async renewJobLock(
+    prisma: PrismaClient,
+    jobId: string,
+    workerId: string,
+    leaseDurationMs: number = 5 * 60 * 1000
+  ): Promise<boolean> {
+    const lockExpiresAt = new Date(Date.now() + leaseDurationMs);
+    const updated = await this.updateJob(prisma, jobId, {
+      lockedBy: workerId,
+      lockExpiresAt
+    });
+    return Boolean(updated);
+  }
+
+  /**
+   * Releases lock upon worker completion or exit.
+   */
+  public static async releaseJobLock(
+    prisma: PrismaClient,
+    jobId: string
+  ): Promise<void> {
+    await this.updateJob(prisma, jobId, {
+      lockedBy: null,
+      lockExpiresAt: null
+    });
+  }
+
   // --- RESULT METHODS ---
 
   public static async createResult(
@@ -236,11 +377,57 @@ export class ListGuardStore {
     const hasTables = await this.checkTableAvailability(prisma);
     if (hasTables) {
       try {
+        // Strip confidence if column not in DB
+        const payload: any = { ...data };
+
+        // Guarantee strict idempotency: check if result already exists for this job and email
+        const existing = await (prisma as any).emailVerificationResult.findFirst({
+          where: {
+            jobId: data.jobId,
+            normalizedEmail: data.normalizedEmail
+          }
+        });
+
+        if (existing) {
+          const dbResult = await (prisma as any).emailVerificationResult.update({
+            where: { id: existing.id },
+            data: payload
+          });
+          return dbResult;
+        }
+
         const dbResult = await (prisma as any).emailVerificationResult.create({
-          data
+          data: payload
         });
         return dbResult;
-      } catch (err) {
+      } catch (err: any) {
+        // If error mentions confidence, retry without confidence
+        if (data.confidence !== undefined) {
+          try {
+            const payloadWithoutConf = { ...data };
+            delete payloadWithoutConf.confidence;
+
+            const existing = await (prisma as any).emailVerificationResult.findFirst({
+              where: {
+                jobId: data.jobId,
+                normalizedEmail: data.normalizedEmail
+              }
+            });
+
+            if (existing) {
+              const retryRes = await (prisma as any).emailVerificationResult.update({
+                where: { id: existing.id },
+                data: payloadWithoutConf
+              });
+              return retryRes;
+            }
+
+            const retryRes = await (prisma as any).emailVerificationResult.create({
+              data: payloadWithoutConf
+            });
+            return retryRes;
+          } catch {}
+        }
         if (!this.isTableMissingError(err)) throw err;
         this.dbHasTables = false;
       }
@@ -295,22 +482,86 @@ export class ListGuardStore {
     return null;
   }
 
+  /**
+   * Retrieves the set of normalized emails already verified for a given jobId.
+   * Guarantees idempotency and safe recovery after worker restarts.
+   */
+  public static async getCompletedEmailSetForJob(
+    prisma: PrismaClient,
+    jobId: string
+  ): Promise<Set<string>> {
+    const hasTables = await this.checkTableAvailability(prisma);
+    if (hasTables) {
+      try {
+        const records = await (prisma as any).emailVerificationResult.findMany({
+          where: { jobId },
+          select: { normalizedEmail: true }
+        });
+        return new Set<string>(records.map((r: any) => r.normalizedEmail));
+      } catch (err) {
+        if (!this.isTableMissingError(err)) throw err;
+        this.dbHasTables = false;
+      }
+    }
+
+    const list = this.resultsMap.get(jobId) || [];
+    return new Set<string>(list.map(r => r.normalizedEmail));
+  }
+
+  /**
+   * Retrieves breakdown of UNKNOWN reasons for a job (e.g. SMTP_TIMEOUT, SMTP_BLOCKED, etc.)
+   */
+  public static async getJobUnknownReasonDistribution(
+    prisma: PrismaClient,
+    jobId: string
+  ): Promise<Record<string, number>> {
+    const distribution: Record<string, number> = {};
+
+    const hasTables = await this.checkTableAvailability(prisma);
+    if (hasTables) {
+      try {
+        const unknowns = await (prisma as any).emailVerificationResult.findMany({
+          where: { jobId, result: 'UNKNOWN' },
+          select: { verificationReason: true }
+        });
+        for (const u of unknowns) {
+          const reason = u.verificationReason || 'UNKNOWN';
+          distribution[reason] = (distribution[reason] || 0) + 1;
+        }
+        return distribution;
+      } catch (err) {
+        if (!this.isTableMissingError(err)) throw err;
+        this.dbHasTables = false;
+      }
+    }
+
+    const list = this.resultsMap.get(jobId) || [];
+    for (const item of list) {
+      if (item.result === 'UNKNOWN') {
+        const reason = item.verificationReason || 'UNKNOWN';
+        distribution[reason] = (distribution[reason] || 0) + 1;
+      }
+    }
+    return distribution;
+  }
+
   public static async getResultsForJob(
     prisma: PrismaClient,
     jobId: string,
     options?: {
+      page?: number;
+      pageSize?: number;
       filter?: string;
       search?: string;
       sortBy?: string;
       sortOrder?: 'asc' | 'desc';
-      page?: number;
-      pageSize?: number;
     }
   ): Promise<{ results: VerificationResultData[]; totalCount: number }> {
     const hasTables = await this.checkTableAvailability(prisma);
     if (hasTables) {
       try {
         const whereClause: any = { jobId };
+
         const upperFilter = options?.filter?.toUpperCase();
         if (['DELIVERABLE', 'UNDELIVERABLE', 'CATCH_ALL', 'UNKNOWN'].includes(upperFilter || '')) {
           whereClause.result = upperFilter;
@@ -321,30 +572,66 @@ export class ListGuardStore {
         }
 
         if (options?.search) {
-          const q = options.search.trim();
-          whereClause.email = { contains: q, mode: 'insensitive' };
+          whereClause.email = { contains: options.search, mode: 'insensitive' };
         }
+
+        const totalCount = await (prisma as any).emailVerificationResult.count({
+          where: whereClause
+        });
 
         const page = options?.page || 1;
         const pageSize = options?.pageSize || 50;
         const skip = (page - 1) * pageSize;
 
-        const totalCount = await (prisma as any).emailVerificationResult.count({
-          where: whereClause
-        });
-        const results = await (prisma as any).emailVerificationResult.findMany({
+        const sortField = options?.sortBy || 'verifiedAt';
+        const sortOrder = options?.sortOrder || 'desc';
+
+        const records = await (prisma as any).emailVerificationResult.findMany({
           where: whereClause,
+          include: {
+            contact: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                fullName: true,
+                jobTitle: true,
+                department: true,
+                city: true,
+                phone: true,
+                organization: {
+                  select: {
+                    name: true,
+                    industry: true
+                  }
+                }
+              }
+            }
+          },
+          orderBy: { [sortField]: sortOrder },
           skip,
-          take: pageSize,
-          orderBy: { [options?.sortBy || 'verifiedAt']: options?.sortOrder || 'desc' }
+          take: pageSize
         });
-        return { results, totalCount };
+
+        const formattedRecords = records.map((r: any) => ({
+          ...r,
+          contact: r.contact
+            ? {
+                ...r.contact,
+                companyName: r.contact.organization?.name || null,
+                industry: r.contact.organization?.industry || null
+              }
+            : null
+        }));
+
+        return { results: formattedRecords, totalCount };
       } catch (err) {
         if (!this.isTableMissingError(err)) throw err;
         this.dbHasTables = false;
       }
     }
 
+    // In-memory fallback
     let list = this.resultsMap.get(jobId) || [];
 
     // Filter
@@ -416,5 +703,9 @@ export class ListGuardStore {
     this.jobsMap.clear();
     this.resultsMap.clear();
     this.cacheMap.clear();
+  }
+
+  public static setForceInMemoryForTesting(force: boolean | null): void {
+    this.dbHasTables = force === null ? null : !force;
   }
 }
