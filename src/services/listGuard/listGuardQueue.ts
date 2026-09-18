@@ -1,55 +1,20 @@
 import { PrismaClient } from '@prisma/client';
-import { VerificationEngine, CompleteVerificationResult } from './verificationEngine';
 import { normalizeEmail } from './emailNormalizer';
-import { ListGuardStore } from './listGuardStore';
+import { ListGuardStore, VerificationJobData } from './listGuardStore';
+import { WorkerHealthService } from './workerHealth';
+import { ListGuardWorker } from '../../workers/listGuardWorker';
 
 const prisma = new PrismaClient();
-const verificationEngine = new VerificationEngine(prisma);
-
-interface QueueItem {
-  jobId: string;
-  userId: string;
-  contactId?: string | undefined;
-  contactEmailId?: string | undefined;
-  email: string;
-  normalizedEmail: string;
-  domain: string;
-}
-
-interface JobProgressStats {
-  total: number;
-  processed: number;
-  deliverable: number;
-  undeliverable: number;
-  catchAll: number;
-  unknown: number;
-  reusedFromCache: number;
-  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-  cancelled: boolean;
-  error?: string;
-}
 
 export class ListGuardQueue {
-  // Fair user queues: userId -> list of queued items
-  private static userQueues: Map<string, QueueItem[]> = new Map();
-  // Live job stats cache for high frequency frontend polling: jobId -> stats
-  private static activeJobs: Map<string, JobProgressStats> = new Map();
-  // Track active domains being checked to bound per-domain concurrency
-  private static activeDomains: Map<string, number> = new Map();
-  // Concurrency counters
-  private static currentGlobalConcurrency: number = 0;
-  private static isWorkerRunning: boolean = false;
-
-  private static get MAX_GLOBAL_CONCURRENCY(): number {
-    return parseInt(process.env.LISTGUARD_MAX_CONCURRENCY || '6', 10);
-  }
-
-  private static get MAX_PER_DOMAIN_CONCURRENCY(): number {
-    return parseInt(process.env.LISTGUARD_PER_DOMAIN_CONCURRENCY || '2', 10);
-  }
-
   /**
-   * Initializes and enqueues a verification job for a given List.
+   * Enqueues a verification job for a given List into the persistent queue.
+   * CRITICAL ARCHITECTURAL RULE:
+   * The API process creates the QUEUED job record in PostgreSQL.
+   * On Vercel / Production Serverless: Vercel API NEVER executes SMTP verification.
+   * Execution is performed by the dedicated worker process.
+   * In local development / test suites: if no standalone worker is active,
+   * dispatches the ListGuardWorker to process the job in the background.
    */
   public static async startJob(params: {
     listId: string;
@@ -77,22 +42,14 @@ export class ListGuardQueue {
     }
 
     // 2. Extract and deduplicate emails from list members
-    const rawItems: Array<{
-      contactId?: string | undefined;
-      contactEmailId?: string | undefined;
-      email: string;
-      normalizedEmail: string;
-      domain: string;
-    }> = [];
-
     const seenNormalizedEmails = new Set<string>();
+    let totalItems = 0;
 
     for (const member of list.members) {
       const contact = member.contact;
       if (!contact) continue;
 
       const emails = contact.emails || [];
-      // Pick primary email first, or first available email
       const primaryEmail = emails.find(e => e.isPrimary) || emails[0];
       const emailStr = primaryEmail?.email;
 
@@ -100,100 +57,73 @@ export class ListGuardQueue {
         const norm = normalizeEmail(emailStr);
         if (norm.normalizedEmail && !seenNormalizedEmails.has(norm.normalizedEmail)) {
           seenNormalizedEmails.add(norm.normalizedEmail);
-          rawItems.push({
-            contactId: contact.id,
-            contactEmailId: primaryEmail?.id,
-            email: norm.rawEmail,
-            normalizedEmail: norm.normalizedEmail,
-            domain: norm.domain
-          });
+          totalItems++;
         }
       }
     }
 
-    // 3. Create the EmailVerificationJob record
+    // 3. Create the EmailVerificationJob record in persistent PostgreSQL queue
+    const isZeroItems = totalItems === 0;
     const job = await ListGuardStore.createJob(prisma, {
       listId: list.id,
       createdByUserId: params.userId,
-      status: rawItems.length === 0 ? 'COMPLETED' : 'QUEUED',
-      total: rawItems.length,
+      status: isZeroItems ? 'COMPLETED' : 'QUEUED',
+      total: totalItems,
       processed: 0,
       deliverable: 0,
       undeliverable: 0,
       catchAll: 0,
       unknown: 0,
       reusedFromCache: 0,
-      startedAt: rawItems.length > 0 ? new Date() : null,
-      completedAt: rawItems.length === 0 ? new Date() : null
+      startedAt: null,
+      completedAt: isZeroItems ? new Date() : null
     });
 
-    const jobStats: JobProgressStats = {
-      total: rawItems.length,
-      processed: 0,
-      deliverable: 0,
-      undeliverable: 0,
-      catchAll: 0,
-      unknown: 0,
-      reusedFromCache: 0,
-      status: rawItems.length === 0 ? 'COMPLETED' : 'QUEUED',
-      cancelled: false
-    };
-
-    this.activeJobs.set(job.id, jobStats);
-
-    if (rawItems.length === 0) {
-      return { jobId: job.id, status: 'COMPLETED', total: 0 };
-    }
-
-    // 4. Enqueue into fair user queue
-    if (!this.userQueues.has(params.userId)) {
-      this.userQueues.set(params.userId, []);
-    }
-    const userQueue = this.userQueues.get(params.userId)!;
-
-    for (const item of rawItems) {
-      userQueue.push({
+    if (isZeroItems) {
+      return {
         jobId: job.id,
-        userId: params.userId,
-        contactId: item.contactId,
-        contactEmailId: item.contactEmailId,
-        email: item.email,
-        normalizedEmail: item.normalizedEmail,
-        domain: item.domain
-      });
+        status: 'COMPLETED',
+        total: 0
+      };
     }
 
-    // 5. Trigger background worker loop
-    this.ensureWorkerRunning();
+    // 4. In Vercel serverless environment, execution stops here.
+    // The job remains QUEUED in PostgreSQL for the dedicated worker to claim.
+    if (process.env.VERCEL) {
+      return {
+        jobId: job.id,
+        status: 'QUEUED',
+        total: totalItems
+      };
+    }
+
+    // 5. In local development or test suites: if no standalone worker is currently reporting heartbeats,
+    // dispatch a dedicated ListGuardWorker instance to process the job in the background.
+    WorkerHealthService.getWorkerHealthStatus(prisma, 10000).then(health => {
+      if (!health.available) {
+        const worker = new ListGuardWorker({ prisma });
+        worker.processJob(job).catch(err => {
+          console.error('[ListGuardQueue Local Worker Error]:', err);
+        });
+      }
+    }).catch(() => {});
 
     return {
       jobId: job.id,
       status: 'QUEUED',
-      total: rawItems.length
+      total: totalItems
     };
   }
 
   /**
-   * Cancels a running or queued job.
+   * Cancels a running or queued job persistently in PostgreSQL.
    */
   public static async cancelJob(jobId: string, userId: string): Promise<boolean> {
     const job = await ListGuardStore.findJobById(prisma, jobId, userId);
-
     if (!job) return false;
 
-    // Remove pending items for this jobId from the user's queue
-    const queue = this.userQueues.get(userId);
-    if (queue) {
-      this.userQueues.set(
-        userId,
-        queue.filter(item => item.jobId !== jobId)
-      );
-    }
-
-    const stats = this.activeJobs.get(jobId);
-    if (stats) {
-      stats.cancelled = true;
-      stats.status = 'CANCELLED';
+    if (job.status === 'COMPLETED' || job.status === 'FAILED') {
+      return false;
     }
 
     await ListGuardStore.updateJob(prisma, jobId, {
@@ -205,14 +135,10 @@ export class ListGuardQueue {
   }
 
   /**
-   * Retrieves live progress stats for a job.
+   * Retrieves current progress stats and unknown reason breakdown for a job.
    */
   public static async getJobProgress(jobId: string, userId: string): Promise<any> {
-    // Check in-memory first for real-time responsiveness
-    const inMem = this.activeJobs.get(jobId);
-    
     const dbJob = await ListGuardStore.findJobById(prisma, jobId, userId);
-
     if (!dbJob) return null;
 
     const list = await prisma.list.findUnique({
@@ -220,214 +146,25 @@ export class ListGuardQueue {
       select: { id: true, name: true }
     });
 
+    const unknownReasons = await ListGuardStore.getJobUnknownReasonDistribution(prisma, jobId);
+
     return {
       id: dbJob.id,
       listId: dbJob.listId,
       listName: list?.name || 'Unknown List',
-      status: inMem?.status || dbJob.status,
-      total: inMem?.total ?? dbJob.total,
-      processed: inMem?.processed ?? dbJob.processed,
-      deliverable: inMem?.deliverable ?? dbJob.deliverable,
-      undeliverable: inMem?.undeliverable ?? dbJob.undeliverable,
-      catchAll: inMem?.catchAll ?? dbJob.catchAll,
-      unknown: inMem?.unknown ?? dbJob.unknown,
-      reusedFromCache: inMem?.reusedFromCache ?? dbJob.reusedFromCache,
-      error: inMem?.error || dbJob.error,
+      status: dbJob.status,
+      total: dbJob.total,
+      processed: dbJob.processed,
+      deliverable: dbJob.deliverable,
+      undeliverable: dbJob.undeliverable,
+      catchAll: dbJob.catchAll,
+      unknown: dbJob.unknown,
+      reusedFromCache: dbJob.reusedFromCache,
+      unknownReasons,
+      error: dbJob.error,
       startedAt: dbJob.startedAt,
       completedAt: dbJob.completedAt,
       createdAt: dbJob.createdAt
     };
-  }
-
-  /**
-   * Ensures the background worker loop is running.
-   */
-  private static ensureWorkerRunning(): void {
-    if (this.isWorkerRunning) return;
-    this.isWorkerRunning = true;
-    this.workerLoop().catch(err => {
-      console.error('[ListGuardQueue workerLoop Error]:', err);
-      this.isWorkerRunning = false;
-    });
-  }
-
-  /**
-   * Main asynchronous queue worker loop with round-robin fair user scheduling
-   * and bounded global & per-domain concurrency.
-   */
-  private static async workerLoop(): Promise<void> {
-    while (true) {
-      // Find all user queues with pending items
-      const activeUserIds = Array.from(this.userQueues.keys()).filter(
-        uid => (this.userQueues.get(uid)?.length || 0) > 0
-      );
-
-      if (activeUserIds.length === 0 && this.currentGlobalConcurrency === 0) {
-        this.isWorkerRunning = false;
-        break;
-      }
-
-      if (this.currentGlobalConcurrency >= this.MAX_GLOBAL_CONCURRENCY) {
-        await new Promise(r => setTimeout(r, 100));
-        continue;
-      }
-
-      let itemPicked = false;
-
-      for (const userId of activeUserIds) {
-        const queue = this.userQueues.get(userId);
-        if (!queue || queue.length === 0) continue;
-
-        // Check per-domain concurrency for the next candidate
-        const candidateIndex = queue.findIndex(item => {
-          const domainActive = this.activeDomains.get(item.domain) || 0;
-          return domainActive < this.MAX_PER_DOMAIN_CONCURRENCY;
-        });
-
-        if (candidateIndex === -1) {
-          // All pending domains for this user are currently at capacity; try next user
-          continue;
-        }
-
-        const [item] = queue.splice(candidateIndex, 1);
-        if (!item) continue;
-
-        // Check if job was cancelled
-        const stats = this.activeJobs.get(item.jobId);
-        if (stats?.cancelled) {
-          continue;
-        }
-
-        // Increment concurrency trackers
-        this.currentGlobalConcurrency++;
-        this.activeDomains.set(
-          item.domain,
-          (this.activeDomains.get(item.domain) || 0) + 1
-        );
-
-        if (stats && stats.status === 'QUEUED') {
-          stats.status = 'RUNNING';
-          ListGuardStore.updateJob(prisma, item.jobId, { status: 'RUNNING', startedAt: new Date() }).catch(() => {});
-        }
-
-        // Process item asynchronously without blocking the loop
-        this.processQueueItem(item)
-          .finally(() => {
-            this.currentGlobalConcurrency--;
-            const count = (this.activeDomains.get(item.domain) || 1) - 1;
-            if (count <= 0) {
-              this.activeDomains.delete(item.domain);
-            } else {
-              this.activeDomains.set(item.domain, count);
-            }
-          })
-          .catch(err => {
-            console.error(`[ListGuardQueue processQueueItem Error for ${item.email}]:`, err);
-          });
-
-        itemPicked = true;
-        if (this.currentGlobalConcurrency >= this.MAX_GLOBAL_CONCURRENCY) {
-          break;
-        }
-      }
-
-      if (!itemPicked) {
-        await new Promise(r => setTimeout(r, 150));
-      }
-    }
-  }
-
-  /**
-   * Processes a single email verification item, updates database and memory stats.
-   * A single bad email NEVER fails the job.
-   */
-  private static async processQueueItem(item: QueueItem): Promise<void> {
-    const stats = this.activeJobs.get(item.jobId);
-    if (stats?.cancelled) return;
-
-    let verification: CompleteVerificationResult;
-
-    try {
-      verification = await verificationEngine.verifyEmail({
-        rawEmail: item.email,
-        userId: item.userId,
-        contactId: item.contactId,
-        contactEmailId: item.contactEmailId
-      });
-    } catch (err: any) {
-      // Graceful fallback to UNKNOWN on unhandled error
-      const now = new Date();
-      verification = {
-        email: item.email,
-        normalizedEmail: item.normalizedEmail,
-        result: 'UNKNOWN',
-        syntaxStatus: 'PASS',
-        domainStatus: 'UNKNOWN',
-        mxStatus: 'UNKNOWN',
-        smtpStatus: 'UNKNOWN',
-        isCatchAll: false,
-        isDisposable: false,
-        isRole: false,
-        suppressionStatus: null,
-        bounceStatus: null,
-        verificationReason: 'UNKNOWN',
-        smtpResponseCode: null,
-        smtpResponse: err?.message || 'Verification exception encountered',
-        reusedFromCache: false,
-        verifiedAt: now,
-        expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
-      };
-    }
-
-    // Persist result record
-    await ListGuardStore.createResult(prisma, {
-      jobId: item.jobId,
-      contactId: item.contactId || null,
-      contactEmailId: item.contactEmailId || null,
-      email: verification.email,
-      normalizedEmail: verification.normalizedEmail,
-      result: verification.result,
-      verificationReason: verification.verificationReason || 'UNKNOWN',
-      syntaxStatus: verification.syntaxStatus,
-      domainStatus: verification.domainStatus,
-      mxStatus: verification.mxStatus,
-      smtpStatus: verification.smtpStatus,
-      isCatchAll: verification.isCatchAll,
-      isDisposable: verification.isDisposable,
-      isRole: verification.isRole,
-      suppressionStatus: verification.suppressionStatus,
-      bounceStatus: verification.bounceStatus,
-      smtpResponseCode: verification.smtpResponseCode,
-      smtpResponse: verification.smtpResponse,
-      verifiedAt: verification.verifiedAt,
-      expiresAt: verification.expiresAt
-    });
-
-    // Update in-memory stats
-    if (stats && !stats.cancelled) {
-      stats.processed++;
-      if (verification.reusedFromCache) stats.reusedFromCache++;
-      if (verification.result === 'DELIVERABLE') stats.deliverable++;
-      else if (verification.result === 'UNDELIVERABLE') stats.undeliverable++;
-      else if (verification.result === 'CATCH_ALL') stats.catchAll++;
-      else stats.unknown++;
-
-      const isFinished = stats.processed >= stats.total;
-      if (isFinished) {
-        stats.status = 'COMPLETED';
-      }
-
-      // Sync progress to DB
-      await ListGuardStore.updateJob(prisma, item.jobId, {
-        processed: stats.processed,
-        deliverable: stats.deliverable,
-        undeliverable: stats.undeliverable,
-        catchAll: stats.catchAll,
-        unknown: stats.unknown,
-        reusedFromCache: stats.reusedFromCache,
-        status: isFinished ? 'COMPLETED' : 'RUNNING',
-        completedAt: isFinished ? new Date() : null
-      });
-    }
   }
 }

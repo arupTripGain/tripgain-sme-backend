@@ -10,9 +10,10 @@ import {
   SmtpVerifierOptions,
   VerificationReason
 } from './smtpVerifier';
+import { VerificationConfidence } from './providerRules';
 import { ListGuardStore } from './listGuardStore';
 
-export { VerificationReason };
+export { VerificationReason, VerificationConfidence };
 
 export type PrimaryVerificationResult =
   | 'DELIVERABLE'
@@ -25,6 +26,7 @@ export interface CompleteVerificationResult {
   normalizedEmail: string;
   result: PrimaryVerificationResult;
   verificationReason: VerificationReason;
+  confidence: VerificationConfidence;
 
   syntaxStatus: 'PASS' | 'FAIL';
   domainStatus: 'PASS' | 'FAIL' | 'UNKNOWN';
@@ -110,6 +112,7 @@ export class VerificationEngine {
         normalizedEmail,
         result: 'UNDELIVERABLE',
         verificationReason: 'SUPPRESSED',
+        confidence: 'HIGH',
         syntaxStatus: 'PASS',
         domainStatus: 'PASS',
         mxStatus: 'PASS',
@@ -120,85 +123,79 @@ export class VerificationEngine {
         suppressionStatus,
         bounceStatus: null,
         smtpResponseCode: null,
-        smtpResponse: `Address is suppressed (${suppressionStatus})`,
+        smtpResponse: `Address is suppressed: ${suppressionStatus}`,
         reusedFromCache: false,
         verifiedAt: now,
         expiresAt
       };
     }
 
-    // 3. Existing bounce data check (checked BEFORE cache reuse)
+    // 3. Historical Hard Bounce check (also checked BEFORE cache)
     let bounceStatus: string | null = null;
     if (params.contactEmailId) {
-      const cEmail = await this.prisma.contactEmail.findUnique({
+      const contactEmail = await this.prisma.contactEmail.findUnique({
         where: { id: params.contactEmailId },
-        select: { bounceCount: true, verificationStatus: true }
+        select: { verificationStatus: true, bounceCount: true }
       });
-      if (cEmail && cEmail.bounceCount > 0 && cEmail.verificationStatus === 'invalid') {
-        bounceStatus = 'HARD_BOUNCED';
+
+      if (contactEmail?.verificationStatus === 'bounced' || (contactEmail?.bounceCount && contactEmail.bounceCount > 0)) {
+        bounceStatus = 'HARD_BOUNCE';
+        return {
+          email: norm.rawEmail,
+          normalizedEmail,
+          result: 'UNDELIVERABLE',
+          verificationReason: 'HARD_BOUNCED',
+          confidence: 'HIGH',
+          syntaxStatus: 'PASS',
+          domainStatus: 'PASS',
+          mxStatus: 'PASS',
+          smtpStatus: 'UNDELIVERABLE_SIGNAL',
+          isCatchAll: false,
+          isDisposable: false,
+          isRole: isRoleAccount(localPart),
+          suppressionStatus: null,
+          bounceStatus,
+          smtpResponseCode: null,
+          smtpResponse: 'Address has a recorded historical bounce',
+          reusedFromCache: false,
+          verifiedAt: now,
+          expiresAt
+        };
       }
     }
 
-    if (!bounceStatus) {
-      const pastBounce = await this.prisma.emailMessage.findFirst({
-        where: {
-          toEmail: { equals: normalizedEmail, mode: 'insensitive' },
-          status: 'bounced'
-        },
-        orderBy: { createdAt: 'desc' },
-        select: { bounceType: true, failureReason: true }
-      });
-
-      if (pastBounce) {
-        if (pastBounce.bounceType?.toLowerCase() === 'hard') {
-          bounceStatus = 'HARD_BOUNCED';
-        } else if (pastBounce.bounceType?.toLowerCase() === 'soft') {
-          bounceStatus = 'SOFT_BOUNCE';
-        }
-      }
-    }
-
-    if (bounceStatus === 'HARD_BOUNCED') {
-      return {
-        email: norm.rawEmail,
-        normalizedEmail,
-        result: 'UNDELIVERABLE',
-        verificationReason: 'HARD_BOUNCED',
-        syntaxStatus: 'PASS',
-        domainStatus: 'PASS',
-        mxStatus: 'PASS',
-        smtpStatus: 'UNDELIVERABLE_SIGNAL',
-        isCatchAll: false,
-        isDisposable: false,
-        isRole: isRoleAccount(localPart),
-        suppressionStatus: null,
-        bounceStatus,
-        smtpResponseCode: '550',
-        smtpResponse: 'Prior hard bounce recorded',
-        reusedFromCache: false,
-        verifiedAt: now,
-        expiresAt
-      };
-    }
-
-    // 4. Cache check (only if not suppressed or hard bounced)
+    // 4. Verification Cache check
     if (!params.forceReverify) {
-      const cached = await ListGuardStore.findCachedResult(this.prisma, normalizedEmail, now);
+      const cached = await ListGuardStore.findCachedResult(
+        this.prisma,
+        normalizedEmail,
+        now
+      );
 
       if (cached) {
-        let reason = (cached.verificationReason as VerificationReason) || 'VALID_MAILBOX';
-        if (!cached.verificationReason) {
-          if (cached.result === 'DELIVERABLE') reason = cached.isRole ? 'ROLE_ADDRESS' : 'VALID_MAILBOX';
-          else if (cached.result === 'CATCH_ALL') reason = 'CATCH_ALL_DOMAIN';
-          else if (cached.result === 'UNDELIVERABLE') reason = cached.isDisposable ? 'DISPOSABLE_DOMAIN' : 'INVALID_MAILBOX';
-          else reason = 'UNKNOWN';
+        const reason: VerificationReason =
+          (cached.verificationReason as VerificationReason) ||
+          (cached.result === 'DELIVERABLE'
+            ? 'VALID_MAILBOX'
+            : cached.result === 'UNDELIVERABLE'
+            ? 'INVALID_MAILBOX'
+            : cached.result === 'CATCH_ALL'
+            ? 'CATCH_ALL_DOMAIN'
+            : 'UNKNOWN');
+
+        let cachedConfidence: VerificationConfidence = 'HIGH';
+        if (cached.confidence === 'HIGH' || cached.confidence === 'MEDIUM' || cached.confidence === 'LOW') {
+          cachedConfidence = cached.confidence;
+        } else if (cached.result === 'UNKNOWN') {
+          cachedConfidence = 'LOW';
         }
 
         return {
-          email: norm.rawEmail || cached.email,
+          email: norm.rawEmail,
           normalizedEmail,
           result: cached.result as PrimaryVerificationResult,
           verificationReason: reason,
+          confidence: cachedConfidence,
           syntaxStatus: cached.syntaxStatus as any,
           domainStatus: cached.domainStatus as any,
           mxStatus: cached.mxStatus as any,
@@ -225,6 +222,7 @@ export class VerificationEngine {
         normalizedEmail,
         result: 'UNDELIVERABLE',
         verificationReason: 'INVALID_SYNTAX',
+        confidence: 'HIGH',
         syntaxStatus: 'FAIL',
         domainStatus: 'FAIL',
         mxStatus: 'FAIL',
@@ -253,6 +251,7 @@ export class VerificationEngine {
         normalizedEmail,
         result: 'UNDELIVERABLE',
         verificationReason: 'DISPOSABLE_DOMAIN',
+        confidence: 'HIGH',
         syntaxStatus: 'PASS',
         domainStatus: 'PASS',
         mxStatus: 'PASS',
@@ -278,6 +277,7 @@ export class VerificationEngine {
         normalizedEmail,
         result: 'UNDELIVERABLE',
         verificationReason: 'NO_MX',
+        confidence: 'HIGH',
         syntaxStatus: 'PASS',
         domainStatus: dnsResult.domainStatus,
         mxStatus: dnsResult.mxStatus,
@@ -301,6 +301,7 @@ export class VerificationEngine {
         normalizedEmail,
         result: 'UNKNOWN',
         verificationReason: 'UNKNOWN',
+        confidence: 'LOW',
         syntaxStatus: 'PASS',
         domainStatus: dnsResult.domainStatus,
         mxStatus: dnsResult.mxStatus,
@@ -329,20 +330,25 @@ export class VerificationEngine {
     // 10. Map to the 4 primary results & structured reason
     let primaryResult: PrimaryVerificationResult;
     let reason: VerificationReason;
+    let confidence: VerificationConfidence = smtpResult.confidence || 'HIGH';
 
     if (smtpResult.isCatchAll || smtpResult.smtpStatus === 'CATCH_ALL') {
       primaryResult = 'CATCH_ALL';
       reason = 'CATCH_ALL_DOMAIN';
+      confidence = smtpResult.confidence || 'HIGH';
     } else if (smtpResult.smtpStatus === 'DELIVERABLE_SIGNAL') {
       primaryResult = 'DELIVERABLE';
       reason = isRole ? 'ROLE_ADDRESS' : (smtpResult.verificationReason || 'VALID_MAILBOX');
+      confidence = smtpResult.confidence || 'HIGH';
     } else if (smtpResult.smtpStatus === 'UNDELIVERABLE_SIGNAL') {
       primaryResult = 'UNDELIVERABLE';
       reason = smtpResult.verificationReason || 'INVALID_MAILBOX';
+      confidence = smtpResult.confidence || 'HIGH';
     } else {
       // TEMPORARY_FAILURE, GREYLISTED, or UNKNOWN
       primaryResult = 'UNKNOWN';
       reason = smtpResult.verificationReason || 'UNKNOWN';
+      confidence = smtpResult.confidence || 'LOW';
     }
 
     return {
@@ -350,6 +356,7 @@ export class VerificationEngine {
       normalizedEmail,
       result: primaryResult,
       verificationReason: reason,
+      confidence,
       syntaxStatus: 'PASS',
       domainStatus: dnsResult.domainStatus,
       mxStatus: dnsResult.mxStatus,

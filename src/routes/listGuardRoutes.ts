@@ -8,13 +8,17 @@ import {
   exportResults,
   createCleanList,
   updateList,
-  getListHistory
+  getListHistory,
+  getWorkerStatus,
+  diagnoseEmail
 } from '../controllers/listGuardController';
 
 const router = Router();
 
-// Dashboard
+// Dashboard & Worker Status
 router.get('/dashboard', getDashboard);
+router.get('/worker-status', getWorkerStatus);
+router.get('/diagnose', diagnoseEmail);
 
 // Verification Jobs
 router.post('/jobs', startVerificationJob);

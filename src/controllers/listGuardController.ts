@@ -3,6 +3,8 @@ import { PrismaClient } from '@prisma/client';
 import { OwnershipGuard } from '../utils/ownershipGuard';
 import { ListGuardQueue } from '../services/listGuard/listGuardQueue';
 import { ListGuardStore } from '../services/listGuard/listGuardStore';
+import { WorkerHealthService } from '../services/listGuard/workerHealth';
+import { DiagnosticService } from '../services/listGuard/diagnosticService';
 
 const prisma = new PrismaClient();
 
@@ -210,6 +212,8 @@ export const getJobResults = async (req: Request, res: Response): Promise<void> 
         normalizedEmail: r.normalizedEmail,
         result: r.result,
         verificationReason: r.verificationReason || 'UNKNOWN',
+        confidence: r.confidence || (r.result === 'DELIVERABLE' || r.result === 'UNDELIVERABLE' ? 'HIGH' : 'MEDIUM'),
+        verifierVersion: '1.0.0',
         syntaxStatus: r.syntaxStatus,
         domainStatus: r.domainStatus,
         mxStatus: r.mxStatus,
@@ -222,6 +226,7 @@ export const getJobResults = async (req: Request, res: Response): Promise<void> 
         smtpResponseCode: r.smtpResponseCode || null,
         smtpResponse: r.smtpResponse || null,
         verifiedAt: r.verifiedAt,
+        expiresAt: r.expiresAt,
         contact: c
           ? {
               id: c.id,
@@ -605,3 +610,41 @@ export const getListHistory = async (req: Request, res: Response): Promise<void>
     res.status(500).json({ error: 'Failed to retrieve list history' });
   }
 };
+
+/**
+ * GET /api/listguard/worker-status
+ * Returns current status and availability of the dedicated verification worker.
+ */
+export const getWorkerStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const health = await WorkerHealthService.getWorkerHealthStatus(prisma);
+    res.status(200).json(health);
+  } catch (error: any) {
+    console.error('[ListGuard getWorkerStatus Error]:', error);
+    res.status(500).json({ error: 'Failed to retrieve worker status' });
+  }
+};
+
+/**
+ * GET /api/listguard/diagnose?email=...
+ * Performs protocol-level diagnostics for a single email without executing SMTP DATA.
+ */
+export const diagnoseEmail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
+    const email = String(req.query.email || req.body?.email || '').trim();
+    if (!email) {
+      res.status(400).json({ error: 'Email parameter is required' });
+      return;
+    }
+
+    const report = await DiagnosticService.runDiagnostics(prisma, email, user.userId);
+    res.status(200).json(report);
+  } catch (error: any) {
+    console.error('[ListGuard diagnoseEmail Error]:', error);
+    res.status(500).json({ error: 'Failed to execute email diagnostics' });
+  }
+};
+
