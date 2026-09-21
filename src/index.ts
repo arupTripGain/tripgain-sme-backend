@@ -53,7 +53,7 @@ import {
   exportCampaignAnalytics 
 } from './controllers/campaignAnalyticsController';
 import { getGlobalAnalytics } from './controllers/analyticsController';
-import { getDashboardStats } from './controllers/dashboardController';
+import { getDashboardStats, getSendingQueueSummary } from './controllers/dashboardController';
 import { runTick, runImapSync } from './controllers/schedulerController';
 import { processEmailScheduler } from './services/schedulerService';
 import { getMailboxes, connectSmtpImap, disconnectMailbox, testMailbox, sendTestEmail, updateMailboxLimits, googleCallback, microsoftCallback } from './controllers/mailboxController';
@@ -114,6 +114,7 @@ app.get('/api/campaigns/:id', authenticateToken, getCampaignById);
 app.get('/api/campaigns/:id/audit-logs', authenticateToken, getCampaignAuditLogs);
 app.get('/api/analytics', authenticateToken, getGlobalAnalytics);
 app.get('/api/dashboard', authenticateToken, getDashboardStats);
+app.get('/api/dashboard/sending-queue', authenticateToken, getSendingQueueSummary);
 app.get('/api/campaigns/:id/analytics', authenticateToken, getCampaignAnalytics);
 app.get('/api/campaigns/:id/analytics/steps', authenticateToken, getCampaignStepAnalytics);
 app.get('/api/campaigns/:id/analytics/links', authenticateToken, getCampaignLinkAnalytics);

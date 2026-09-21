@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { OwnershipGuard } from '../utils/ownershipGuard';
+import { getCalendarBucketBounds } from '../services/quotaService';
+import { resolveEffectiveSendingDays, getZonedParts } from '../utils/businessDays';
 
 const prisma = new PrismaClient();
 
@@ -269,3 +271,349 @@ export const getDashboardStats = async (req: Request, res: Response): Promise<vo
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+/**
+ * Calculates operationally truthful sending queue metrics matching
+ * the scheduler's business-day, campaign, and mailbox eligibility rules.
+ */
+export async function calculateSendingQueueSummary(
+  user: { userId: string; email?: string | null | undefined; name?: string | null | undefined },
+  client: any = prisma,
+  now: Date = new Date()
+) {
+  const tz = 'Asia/Kolkata';
+
+  // 1. Resolve date buckets in Asia/Kolkata
+  const todayBounds = getCalendarBucketBounds(now, tz);
+  const tomorrowDate = new Date(todayBounds.endOfDay.getTime() + 1000);
+  const tomorrowBounds = getCalendarBucketBounds(tomorrowDate, tz);
+  const day2Date = new Date(tomorrowBounds.endOfDay.getTime() + 1000);
+  const day2Bounds = getCalendarBucketBounds(day2Date, tz);
+  const day3Date = new Date(day2Bounds.endOfDay.getTime() + 1000);
+  const day3Bounds = getCalendarBucketBounds(day3Date, tz);
+
+  const formatDateStr = (date: Date) => {
+    const parts = getZonedParts(date, tz);
+    return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+  };
+
+  const formatLabel = (date: Date) => {
+    return date.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric' });
+  };
+
+  const todayStr = formatDateStr(now);
+  const tomorrowStr = formatDateStr(tomorrowDate);
+  const day2Str = formatDateStr(day2Date);
+  const day3Str = formatDateStr(day3Date);
+
+  const emptyResponse = {
+    timezone: tz,
+    today: {
+      date: todayStr,
+      planned: 0,
+      sent: 0,
+      queued: 0,
+      progressPercent: 0
+    },
+    tomorrow: {
+      date: tomorrowStr,
+      queued: 0
+    },
+    next3Days: {
+      totalQueued: 0,
+      days: [] as Array<{ date: string; label: string; queued: number }>
+    }
+  };
+
+  // 2. Fetch user campaigns with minimal scalar fields
+  const orConditions: Array<{ userId: string } | { owner: string }> = [{ userId: user.userId }];
+  if (user.name) orConditions.push({ owner: user.name });
+  if (user.email) orConditions.push({ owner: user.email });
+
+  const campaigns = await client.campaign.findMany({
+    where: { OR: orConditions },
+    select: {
+      id: true,
+      name: true,
+      status: true,
+      approvalStatus: true,
+      sendingDays: true,
+      senderMailboxes: true,
+      timezone: true
+    }
+  });
+
+  if (!campaigns || campaigns.length === 0) {
+    return emptyResponse;
+  }
+
+  const allCampaignIds = campaigns.map((c: any) => c.id);
+
+  // 3. SENT Today: ground truth dispatched email messages for user's campaigns today (Asia/Kolkata)
+  let sentToday = 0;
+  if (allCampaignIds.length > 0) {
+    sentToday = await client.emailMessage.count({
+      where: {
+        campaignId: { in: allCampaignIds },
+        status: { in: ['sent', 'delivered', 'opened', 'clicked', 'replied', 'bounced'] },
+        sentAt: { gte: todayBounds.startOfDay, lt: todayBounds.endOfDay }
+      }
+    });
+  }
+
+  // 4. Eligible active campaigns (approved & active)
+  const activeCampaigns = campaigns.filter((c: any) =>
+    c.status === 'active' && (!c.approvalStatus || c.approvalStatus === 'APPROVED')
+  );
+
+  if (activeCampaigns.length === 0) {
+    const planned = sentToday;
+    const progressPercent = planned > 0 ? 100 : 0;
+    return {
+      timezone: tz,
+      today: {
+        date: todayStr,
+        planned,
+        sent: sentToday,
+        queued: 0,
+        progressPercent
+      },
+      tomorrow: {
+        date: tomorrowStr,
+        queued: 0
+      },
+      next3Days: {
+        totalQueued: 0,
+        days: []
+      }
+    };
+  }
+
+  // 5. Active, connected mailboxes
+  const configuredMailboxRefs = Array.from(
+    new Set(activeCampaigns.flatMap((c: any) => c.senderMailboxes || []))
+  );
+
+  const activeMailboxes = await client.mailbox.findMany({
+    where: {
+      OR: [
+        ...(configuredMailboxRefs.length > 0 ? [
+          { id: { in: configuredMailboxRefs } },
+          { email: { in: configuredMailboxRefs } }
+        ] : []),
+        { status: 'CONNECTED', isActive: true }
+      ],
+      status: 'CONNECTED',
+      isActive: true
+    },
+    select: {
+      id: true,
+      email: true,
+      sendingDays: true,
+      sendingTimezone: true,
+      status: true,
+      isActive: true
+    }
+  });
+
+  const activeMailboxIds = activeMailboxes.map((m: any) => m.id);
+
+  // 6. Campaign-level allowed days evaluation
+  // Maps campaignId -> Set of canonical allowed weekdays (e.g. Set('MON', 'TUE', ...))
+  const campaignAllowedDaysMap = new Map<string, Set<string>>();
+
+  for (const camp of activeCampaigns) {
+    const configured = camp.senderMailboxes || [];
+    let matchedMbs = activeMailboxes.filter((m: any) =>
+      configured.includes(m.id) || configured.includes(m.email)
+    );
+    if (matchedMbs.length === 0 && activeMailboxes.length > 0) {
+      matchedMbs = [activeMailboxes[0]!];
+    }
+
+    if (matchedMbs.length === 0) {
+      // Campaign has no active connected mailbox -> cannot dispatch
+      continue;
+    }
+
+    const allowedDays = new Set<string>();
+    for (const mb of matchedMbs) {
+      const days = resolveEffectiveSendingDays({
+        campaignDays: camp.sendingDays,
+        mailboxDays: mb.sendingDays
+      });
+      for (const d of days) allowedDays.add(d);
+    }
+
+    if (allowedDays.size > 0) {
+      campaignAllowedDaysMap.set(camp.id, allowedDays);
+    }
+  }
+
+  const canSendOnDay = (campaignId: string, dayOfWeek: string): boolean => {
+    const days = campaignAllowedDaysMap.get(campaignId);
+    return !!days && days.has(dayOfWeek);
+  };
+
+  const eligibleCampIdsToday = activeCampaigns
+    .filter((c: any) => canSendOnDay(c.id, todayBounds.currentDayOfWeek))
+    .map((c: any) => c.id);
+
+  const eligibleCampIdsTomorrow = activeCampaigns
+    .filter((c: any) => canSendOnDay(c.id, tomorrowBounds.currentDayOfWeek))
+    .map((c: any) => c.id);
+
+  const eligibleCampIdsDay2 = activeCampaigns
+    .filter((c: any) => canSendOnDay(c.id, day2Bounds.currentDayOfWeek))
+    .map((c: any) => c.id);
+
+  const eligibleCampIdsDay3 = activeCampaigns
+    .filter((c: any) => canSendOnDay(c.id, day3Bounds.currentDayOfWeek))
+    .map((c: any) => c.id);
+
+  // 7. Check suppression list for user
+  let suppressedNormalizedEmails: string[] = [];
+  if (client.suppressionList) {
+    const suppressedCount = await client.suppressionList.count({
+      where: { userId: user.userId }
+    });
+    if (suppressedCount > 0) {
+      const suppressedList = await client.suppressionList.findMany({
+        where: { userId: user.userId },
+        select: { normalizedEmail: true },
+        take: 10000
+      });
+      suppressedNormalizedEmails = suppressedList.map((s: any) => s.normalizedEmail);
+    }
+  }
+
+  // Base filter for eligible queued enrollments:
+  // - status in ['pending', 'active']
+  // - stoppedAt is null
+  // - contact not marked doNotContact, not unsubscribed, not on suppression list
+  // - mailbox eligibility: unassigned new leads (mailboxId null & lastSentAt null) OR assigned to active connected mailbox
+  const baseEnrollmentWhere: any = {
+    status: { in: ['pending', 'active'] },
+    stoppedAt: null,
+    contact: {
+      doNotContact: false,
+      unsubscribeAt: null,
+      ...(suppressedNormalizedEmails.length > 0 ? {
+        emails: {
+          none: {
+            normalizedEmail: { in: suppressedNormalizedEmails }
+          }
+        }
+      } : {})
+    },
+    OR: [
+      { mailboxId: null, lastSentAt: null },
+      ...(activeMailboxIds.length > 0 ? [{ mailboxId: { in: activeMailboxIds } }] : [])
+    ]
+  };
+
+  // 8. Execute targeted count queries in parallel (indexed, COUNT only, no full object hydration)
+  const [queuedToday, queuedTomorrow, queuedDay2, queuedDay3] = await Promise.all([
+    // Today
+    eligibleCampIdsToday.length > 0
+      ? client.enrollment.count({
+          where: {
+            campaignId: { in: eligibleCampIdsToday },
+            ...baseEnrollmentWhere,
+            OR: [
+              { nextSendAt: { lte: todayBounds.endOfDay } },
+              { nextSendAt: null }
+            ]
+          }
+        })
+      : Promise.resolve(0),
+
+    // Tomorrow
+    eligibleCampIdsTomorrow.length > 0
+      ? client.enrollment.count({
+          where: {
+            campaignId: { in: eligibleCampIdsTomorrow },
+            ...baseEnrollmentWhere,
+            nextSendAt: {
+              gte: tomorrowBounds.startOfDay,
+              lt: tomorrowBounds.endOfDay
+            }
+          }
+        })
+      : Promise.resolve(0),
+
+    // Day 2
+    eligibleCampIdsDay2.length > 0
+      ? client.enrollment.count({
+          where: {
+            campaignId: { in: eligibleCampIdsDay2 },
+            ...baseEnrollmentWhere,
+            nextSendAt: {
+              gte: day2Bounds.startOfDay,
+              lt: day2Bounds.endOfDay
+            }
+          }
+        })
+      : Promise.resolve(0),
+
+    // Day 3
+    eligibleCampIdsDay3.length > 0
+      ? client.enrollment.count({
+          where: {
+            campaignId: { in: eligibleCampIdsDay3 },
+            ...baseEnrollmentWhere,
+            nextSendAt: {
+              gte: day3Bounds.startOfDay,
+              lt: day3Bounds.endOfDay
+            }
+          }
+        })
+      : Promise.resolve(0)
+  ]);
+
+  const totalToday = sentToday + queuedToday;
+  const progressPercent = totalToday > 0 ? Math.round((sentToday / totalToday) * 100) : 0;
+  const queuedNext3Days = queuedTomorrow + queuedDay2 + queuedDay3;
+
+  const next3DaysBreakdown = [
+    { date: tomorrowStr, label: formatLabel(tomorrowDate), queued: queuedTomorrow },
+    { date: day2Str, label: formatLabel(day2Date), queued: queuedDay2 },
+    { date: day3Str, label: formatLabel(day3Date), queued: queuedDay3 }
+  ].filter(d => d.queued > 0);
+
+  return {
+    timezone: tz,
+    today: {
+      date: todayStr,
+      planned: totalToday,
+      sent: sentToday,
+      queued: queuedToday,
+      progressPercent
+    },
+    tomorrow: {
+      date: tomorrowStr,
+      queued: queuedTomorrow
+    },
+    next3Days: {
+      totalQueued: queuedNext3Days,
+      days: next3DaysBreakdown
+    }
+  };
+}
+
+/**
+ * Controller endpoint: GET /api/dashboard/sending-queue
+ */
+export const getSendingQueueSummary = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
+    const summary = await calculateSendingQueueSummary(user, prisma);
+    res.status(200).json(summary);
+  } catch (error) {
+    console.error('Error fetching sending queue summary:', error);
+    res.status(500).json({ error: 'Failed to calculate sending queue summary' });
+  }
+};
+
