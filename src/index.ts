@@ -54,7 +54,7 @@ import {
 } from './controllers/campaignAnalyticsController';
 import { getGlobalAnalytics } from './controllers/analyticsController';
 import { getDashboardStats } from './controllers/dashboardController';
-import { runTick } from './controllers/schedulerController';
+import { runTick, runImapSync } from './controllers/schedulerController';
 import { processEmailScheduler } from './services/schedulerService';
 import { getMailboxes, connectSmtpImap, disconnectMailbox, testMailbox, sendTestEmail, updateMailboxLimits, googleCallback, microsoftCallback } from './controllers/mailboxController';
 import { login, register, getMe, getUsers, deleteUser } from './controllers/authController';
@@ -203,6 +203,8 @@ app.get('/api/bulk-campaigns/:id/recipients', authenticateToken, getBulkCampaign
 // Phase 6 Engine & Tracking
 app.get('/api/scheduler/tick', runTick);
 app.post('/api/scheduler/tick', runTick);
+app.get('/api/scheduler/imap-sync', runImapSync);
+app.post('/api/scheduler/imap-sync', runImapSync);
 app.post('/api/webhooks/simulate-event', simulateEvent);
 app.post('/api/webhooks/email-provider', handleProviderWebhook); // Phase 9
 app.get('/t/:trackingToken', handleOpenTracking); // Open tracking pixel

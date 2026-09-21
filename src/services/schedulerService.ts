@@ -145,7 +145,11 @@ export async function processEmailScheduler(options: {
   force?: boolean | undefined; 
   bypassStepDelay?: boolean | undefined;
   campaignId?: string | undefined;
-} = {}): Promise<{ emailsSent: number; emailsSkipped: number; emailsFailed: number }> {
+} = {}): Promise<{ 
+  emailsSent: number; 
+  emailsSkipped: number; 
+  emailsFailed: number;
+}> {
   const workerId = crypto.randomUUID();
   let emailsSent = 0;
   let emailsSkipped = 0;
@@ -593,7 +597,12 @@ export async function processEmailScheduler(options: {
           const trackingToken = crypto.randomUUID();
           const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
           let trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
-          if (!trackingBaseUrl && !isProduction) {
+          if (isProduction) {
+            if (!trackingBaseUrl || trackingBaseUrl.includes('localhost') || trackingBaseUrl.includes('127.0.0.1')) {
+              console.error('[Scheduler] TRACKING_BASE_URL is missing or invalid (contains localhost) in production environment. Unsubscribe links will be omitted.');
+              trackingBaseUrl = '';
+            }
+          } else if (!trackingBaseUrl) {
             trackingBaseUrl = 'http://localhost:3001';
           }
           const unsubscribeLink = trackingBaseUrl ? `${trackingBaseUrl}/u/${trackingToken}` : '#';
@@ -729,12 +738,13 @@ export async function processEmailScheduler(options: {
             // Tracking base URL
             const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
             let trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
-            if (!trackingBaseUrl && !isProduction) {
+            if (isProduction) {
+              if (!trackingBaseUrl || trackingBaseUrl.includes('localhost') || trackingBaseUrl.includes('127.0.0.1')) {
+                console.error('[Scheduler] TRACKING_BASE_URL is missing or invalid (contains localhost) in production environment. Tracking pixel and link rewrites are omitted to fail safely without generating localhost URLs.');
+                trackingBaseUrl = '';
+              }
+            } else if (!trackingBaseUrl) {
               trackingBaseUrl = 'http://localhost:3001';
-            }
-
-            if (!trackingBaseUrl && isProduction) {
-              console.warn('[Scheduler] TRACKING_BASE_URL is not configured in production. Tracking pixel and link rewrites are omitted to fail safely without generating localhost URLs.');
             }
 
             // Open tracking pixel
@@ -1098,7 +1108,7 @@ export async function processEmailScheduler(options: {
       }
     });
     const totalTickDuration = Math.round(performance.now() - tickStart);
-    console.log(`[Scheduler] Tick completed in ${totalTickDuration}ms. Campaigns checked: ${campaigns.length}, Emails sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
+    console.log(`[Scheduler] Outbound tick completed in ${totalTickDuration}ms. Campaigns checked: ${campaigns.length}, Emails sent: ${emailsSent}, Skipped: ${emailsSkipped}, Failed: ${emailsFailed}`);
     return { emailsSent, emailsSkipped, emailsFailed };
   } catch (err) {
     console.error(`[Scheduler] Critical Error:`, err);

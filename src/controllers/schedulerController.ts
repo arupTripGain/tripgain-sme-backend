@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { processEmailScheduler } from '../services/schedulerService';
+import { syncAllActiveMailboxes } from '../services/imapSyncService';
+import { executeWithImapSyncLock } from '../services/cronLockService';
 import { JWT_SECRET } from '../middleware/authMiddleware';
 
 export function verifySchedulerAuth(
@@ -92,5 +94,63 @@ export const runTick = async (req: Request, res: Response): Promise<void> => {
   } catch (error: any) {
     console.error('[Scheduler] Error executing scheduler tick:', error);
     res.status(500).json({ success: false, error: error?.message || 'Failed to execute scheduler tick' });
+  }
+};
+
+export const runImapSync = async (req: Request, res: Response): Promise<void> => {
+  const expectedSecret = (process.env.CRON_SECRET || '').trim();
+
+  // If in production and CRON_SECRET is missing, fail safely
+  if (!expectedSecret && (process.env.NODE_ENV === 'production' || !!process.env.VERCEL)) {
+    console.error('[IMAP Sync] CRON_SECRET is not configured in production environment variables.');
+    res.status(500).json({ success: false, error: 'Server configuration error: CRON_SECRET not set' });
+    return;
+  }
+
+  const authResult = verifySchedulerAuth(
+    req.headers.authorization,
+    req.headers['x-cron-secret'] as string | undefined,
+    req.user,
+    expectedSecret,
+    JWT_SECRET
+  );
+
+  if (!authResult.isAuthorized) {
+    res.status(authResult.status || 401).json({ success: false, error: authResult.error });
+    return;
+  }
+
+  try {
+    const lockResult = await executeWithImapSyncLock(async () => {
+      return await syncAllActiveMailboxes();
+    }, 120000);
+
+    if (!lockResult.acquired) {
+      console.log('[IMAP Sync] Another instance is currently executing IMAP sync. Skipping concurrent execution.');
+      res.status(200).json({
+        success: true,
+        message: 'IMAP sync already in progress on another worker. Skipped overlapping execution.',
+        mailboxesChecked: 0,
+        repliesSynced: 0,
+        newConversations: 0,
+        mailboxErrors: 0,
+        skippedDueToLock: true
+      });
+      return;
+    }
+
+    const summary = lockResult.result!;
+    res.status(200).json({
+      success: true,
+      message: 'Inbound IMAP synchronization complete',
+      mailboxesChecked: summary.mailboxesChecked,
+      repliesSynced: summary.repliesSynced,
+      newConversations: summary.newConversations,
+      mailboxErrors: summary.mailboxErrors,
+      details: summary.details
+    });
+  } catch (error: any) {
+    console.error('[IMAP Sync] Error executing IMAP sync:', error);
+    res.status(500).json({ success: false, error: error?.message || 'Failed to execute IMAP sync' });
   }
 };

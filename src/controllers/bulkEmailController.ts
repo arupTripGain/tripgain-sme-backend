@@ -753,9 +753,18 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    const trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || 'http://localhost:3001').replace(/\/+$/, '');
+    const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
+    let trackingBaseUrl = (process.env.TRACKING_BASE_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
+    if (isProduction) {
+      if (!trackingBaseUrl || trackingBaseUrl.includes('localhost') || trackingBaseUrl.includes('127.0.0.1')) {
+        console.error('[BulkEmail] TRACKING_BASE_URL is missing or invalid (contains localhost) in production environment. Tracking URLs omitted to fail safely.');
+        trackingBaseUrl = '';
+      }
+    } else if (!trackingBaseUrl) {
+      trackingBaseUrl = 'http://localhost:3001';
+    }
     const sampleToken = 'test-preview-token';
-    const unsubscribeLink = `${trackingBaseUrl}/u/${sampleToken}`;
+    const unsubscribeLink = trackingBaseUrl ? `${trackingBaseUrl}/u/${sampleToken}` : '#';
 
     const step1 = campaign.sequences?.[0]?.steps?.[0];
     const rawSubject = step1?.subjectTemplate || 'Test Email Preview';
@@ -801,7 +810,7 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
         const renderedSubject = `[TEST] ` + Handlebars.compile(rawSubject, { noEscape: true })(templateContext);
         let renderedBody = Handlebars.compile(rawBody, { noEscape: true })(templateContext);
 
-        if (!rawBody.includes('{{unsubscribeLink}}')) {
+        if (!rawBody.includes('{{unsubscribeLink}}') && unsubscribeLink && unsubscribeLink !== '#') {
           renderedBody += `<br><hr><p style="font-size:12px;color:#888;">To unsubscribe, <a href="${unsubscribeLink}">click here</a>.</p>`;
         }
 
@@ -831,8 +840,10 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             html: renderedBody,
             headers: {
               'X-TripGain-Test': 'true',
-              'List-Unsubscribe': `<${unsubscribeLink}>`,
-              'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+              ...(unsubscribeLink && unsubscribeLink !== '#' ? {
+                'List-Unsubscribe': `<${unsubscribeLink}>`,
+                'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
+              } : {})
             }
           });
 

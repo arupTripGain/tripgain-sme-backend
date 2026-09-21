@@ -16,6 +16,7 @@
     "dev": "nodemon src/index.ts",
     "test": "ts-node tests/rotationService.test.ts && ts-node tests/schedulerAuth.test.ts && ts-node tests/schedulerOptimization.test.ts && ts-node tests/schedulerConcurrencyAndLocking.test.ts && ts-node tests/sequenceSubjectAndThreading.test.ts && ts-node tests/outreachAnalytics.test.ts && ts-node tests/multiUserDataIsolation.test.ts && ts-node tests/byokGeminiAi.test.ts && ts-node tests/campaignPreviewLeadResolution.test.ts && ts-node tests/businessDayScheduler.test.ts",
     "test:lead-intel": "ts-node tests/leadIntelligence.test.ts",
+    "worker:listguard": "ts-node src/workers/listGuardWorker.ts",
     "postinstall": "prisma generate"
   },
   "keywords": [],
@@ -28,6 +29,7 @@
     "@types/handlebars": "^4.0.40",
     "@types/mailparser": "^3.4.6",
     "@types/multer": "^2.2.0",
+    "@types/pg": "^8.23.1",
     "bcryptjs": "^3.0.3",
     "cheerio": "^1.2.0",
     "cors": "^2.8.6",
@@ -41,6 +43,7 @@
     "multer": "^2.3.0",
     "nodemailer": "^10.0.0",
     "pdf-parse": "1.1.1",
+    "pg": "^8.23.0",
     "playwright": "^1.63.0",
     "xlsx": "^0.18.5"
   },
