@@ -54,17 +54,19 @@ export interface DirectoryExtractionResult extends ExtractionResult {
 
 export interface CandidateCard {
   companyName?: string | undefined;
+  rawName?: string | undefined;
   detailUrl?: string | undefined;
   email?: string | undefined;
   phone?: string | undefined;
   category?: string | undefined;
   city?: string | undefined;
   hallOrBooth?: string | undefined;
+  boothNumber?: string | undefined;
+  hallNumber?: string | undefined;
   websiteUrl?: string | undefined;
   rawText: string;
 }
 
-// Common generic directory title / organizer phrases to ignore as company names
 const ORGANIZER_TITLE_PATTERNS = [
   /^exhibitor\s+directory/i,
   /^directory/i,
@@ -76,6 +78,11 @@ const ORGANIZER_TITLE_PATTERNS = [
   /^expo\s+directory/i,
   /^all\s+exhibitors/i,
   /^search\s+exhibitors/i,
+  /^featured\s*\(\d+\)/i,
+  /^(?:npe|pack\s*expo|imex|gitex|ces|hannover\s*messe|semashow|canton\s*fair|fabtech)\s*(?:20\d\d)?/i,
+  /:\s*the\s+(?:plastics|packaging|manufacturing|baking)\s+show/i,
+  /\b(?:the\s+plastics\s+show|the\s+packaging\s+show|the\s+baking\s+expo)\b/i,
+  /^(?:event|conference|summit|exhibition|trade\s*show)\s*(?:20\d\d)?$/i,
 ];
 
 /**
@@ -168,7 +175,13 @@ export function mapJsonRecordToLead(item: any, sourceUrl: string, baseOriginUrl:
   }
 
   return {
+    rawName: companyName.trim(),
     companyName: companyName.trim(),
+    boothNumber: typeof stall === 'string' ? stall.trim() : undefined,
+    hallNumber: typeof hall === 'string' ? hall.trim() : undefined,
+    category: typeof industry === 'string' ? industry.trim() : undefined,
+    detailUrl,
+    sourceUrl,
     contactName: typeof contactName === 'string' ? contactName.trim() : undefined,
     email,
     phone: typeof phone === 'string' ? phone.trim() : undefined,
@@ -195,8 +208,32 @@ export function extractCardsFromHtml(
   $('nav, header, footer, [class*="menu"], [class*="nav"], [class*="sidebar"], [id*="menu"], [id*="nav"]').remove();
   const cards: CandidateCard[] = [];
 
+  // Check if baseUrl specifies a fragment/hash targeting a section or if DOM has a dedicated exhibitor section
+  let targetScope: any = $('body');
+  try {
+    const parsedUrl = new URL(baseUrl);
+    const hash = parsedUrl.hash.replace(/^#/, '');
+    if (hash && $(`#${hash}`).length > 0) {
+      targetScope = $(`#${hash}`);
+    }
+  } catch {}
+
+  if (targetScope.is('body')) {
+    const dedicatedSection = $('section[id*="exhibitor"], div[id*="exhibitor"], section[class*="exhibitor"], [class*="exhibitor-section"]');
+    if (dedicatedSection.length > 0 && dedicatedSection.find('[class*="exhibitor"]').length >= 10) {
+      targetScope = dedicatedSection;
+    }
+  }
+
+  // Strip non-card controls from target scope
+  targetScope.find('button, [class*="btn"], [class*="tab-btn"], [class*="nav-tabs"], [class*="filter"]').remove();
+
   // Repeated container selectors
   const containerSelectors = [
+    '[class*="exhibitor-card"]',
+    '[class*="exhibitor_card"]',
+    '[class*="exhibitor-item"]',
+    '[class*="exhibitor_item"]',
     'article',
     '.card',
     '[class*="card"]',
@@ -210,9 +247,14 @@ export function extractCardsFromHtml(
     'ul.directory-list > li',
   ];
 
-  let selectedElements = $(containerSelectors.join(', '));
+  let selectedElements: any = targetScope.find(containerSelectors.join(', '));
   
-  // If no common class matched, look for repeated divs that have headings or contacts
+  // If no common class matched in target scope, search whole body
+  if (selectedElements.length === 0) {
+    selectedElements = $(containerSelectors.join(', '));
+  }
+
+  // If still no common class matched, look for repeated divs that have headings or contacts
   if (selectedElements.length === 0) {
     selectedElements = $('div').filter((_, el) => {
       const hasHeading = $(el).find('h1, h2, h3, h4, h5, strong').length > 0;
@@ -223,9 +265,15 @@ export function extractCardsFromHtml(
     });
   }
 
-  selectedElements.each((_, el) => {
+  // Filter out wrapper containers that contain child matching cards
+  const leafElements = selectedElements.filter((_: number, el: any) => {
+    return $(el).find(containerSelectors.join(', ')).length === 0;
+  });
+  const effectiveElements = leafElements.length > 0 ? leafElements : selectedElements;
+
+  effectiveElements.each((_: number, el: any) => {
     const text = $(el).text().replace(/\s+/g, ' ').trim();
-    if (text.length < 10) return;
+    if (text.length < 2) return;
 
     // Extract company name: prefer h1-h5 or strong or [class*="name"]
     let companyName = $(el).find('h1, h2, h3, h4, h5, [class*="name"], [class*="title"], strong').first().text().trim();
@@ -233,10 +281,20 @@ export function extractCardsFromHtml(
       // Fallback: first link text
       companyName = $(el).find('a').first().text().trim();
     }
+    if (!companyName) {
+      // Direct text fallback for cards where company name is direct text node (e.g. <div class="exhibitor-card-item">Company Name</div>)
+      const directText = $(el).clone().children().remove().end().text().replace(/\s+/g, ' ').trim() || text;
+      if (directText.length >= 2 && directText.length <= 100) {
+        companyName = directText;
+      }
+    }
 
     // Clean company name
     companyName = companyName.replace(/^(exhibitor|company|name):\s*/i, '').trim();
-    if (!companyName || isDirectoryOrganizerName(companyName)) return;
+    if (!companyName || companyName.length < 2 || isDirectoryOrganizerName(companyName)) return;
+
+    // Filter out obvious navigation / tab boilerplate
+    if (/^(explore|view all|show more|read more|click here|home|about us|contact us|past exhibitors|confirmed exhibitors)$/i.test(companyName)) return;
 
     // Find candidate detail link
     let detailUrl: string | undefined;
@@ -445,30 +503,102 @@ export function parseDetailPageHtml(
   let domain: string | undefined;
   const detailHost = new URL(detailUrl).hostname;
   const detailRoot = getRootDomain(detailHost);
+  
+  const EVENT_EXCLUSIONS = [
+    'mapyourshow.com', 'xpressreg.net', 'eventbrite.com', 'expofp.com',
+    'a2zinc.net', 'google.com', 'apple.com', 'microsoft.com',
+    'npe.org', 'packexpointernational.com', 'plasticsindustry.org', 'pmmi.org'
+  ];
 
+  // Pass 1: Explicit website buttons or anchor texts that look like domains/URLs
   $('a[href]').each((_, a) => {
     const href = $(a).attr('href');
     if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
     try {
       const resolved = new URL(href, detailUrl);
       const host = resolved.hostname.toLowerCase();
-      // Must be an external domain (different from directory organizer domain)
-      if (host !== detailHost && !host.endsWith(`.${detailRoot}`) && !EXCLUDED_DOMAINS.some(d => host.includes(d))) {
-        websiteUrl = resolved.toString();
-        domain = normalizeDomain(websiteUrl) || undefined;
-        return false; // Break
+      if (
+        host !== detailHost &&
+        !host.endsWith(`.${detailRoot}`) &&
+        !EXCLUDED_DOMAINS.some((d) => host.includes(d)) &&
+        !EVENT_EXCLUSIONS.some((d) => host.includes(d)) &&
+        !resolved.pathname.includes('privacy') &&
+        !resolved.pathname.includes('terms') &&
+        !resolved.pathname.includes('register')
+      ) {
+        const text = $(a).text().trim().toLowerCase();
+        const cls = ($(a).attr('class') || '').toLowerCase();
+        const isExplicit =
+          text.includes('www.') ||
+          text.includes('.com') ||
+          text.includes('.net') ||
+          text.includes('.org') ||
+          text.includes('.io') ||
+          text.includes('.co') ||
+          text.includes('http') ||
+          /^(?:visit\s+website|company\s+website|official\s+website|website|homepage|view\s+site)$/i.test(text) ||
+          cls.includes('website') ||
+          cls.includes('web-link') ||
+          cls.includes('company-link');
+
+        if (isExplicit) {
+          websiteUrl = resolved.toString();
+          domain = normalizeDomain(websiteUrl) || undefined;
+          return false; // Break
+        }
       }
     } catch {}
   });
 
+  // Pass 2: Fallback to first non-event outbound link
+  if (!websiteUrl) {
+    $('a[href]').each((_, a) => {
+      const href = $(a).attr('href');
+      if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+      try {
+        const resolved = new URL(href, detailUrl);
+        const host = resolved.hostname.toLowerCase();
+        if (
+          host !== detailHost &&
+          !host.endsWith(`.${detailRoot}`) &&
+          !EXCLUDED_DOMAINS.some((d) => host.includes(d)) &&
+          !EVENT_EXCLUSIONS.some((d) => host.includes(d)) &&
+          !host.includes('expo') &&
+          !resolved.pathname.includes('privacy') &&
+          !resolved.pathname.includes('terms') &&
+          !resolved.pathname.includes('register')
+        ) {
+          websiteUrl = resolved.toString();
+          domain = normalizeDomain(websiteUrl) || undefined;
+          return false; // Break
+        }
+      } catch {}
+    });
+  }
+
   // Hall / Booth
-  const boothMatch = fullText.match(/\b(hall|booth|stall|stand)[\s#:]*([a-zA-Z0-9\s\-/]+)/i);
-  if (boothMatch && boothMatch[0]) {
-    address = boothMatch[0].trim();
+  let boothNumber: string | undefined;
+  let hallNumber: string | undefined;
+  const STOPWORDS = new Set(['the', 'at', 'in', 'on', 'near', 'is', 'and', 'to', 'our', 'a', 'an', 'of', 'for', 'all', 'new']);
+  const boothMatch = fullText.match(/\b(?:booth|stall|stand)[\s#:]*([a-zA-Z0-9\-/]+)/i);
+  if (boothMatch && boothMatch[1] && !STOPWORDS.has(boothMatch[1].toLowerCase().trim())) {
+    boothNumber = boothMatch[1].trim();
+  }
+  const hallMatch = fullText.match(/\b(?:hall)[\s#:]*([a-zA-Z0-9\-/]+)/i);
+  if (hallMatch && hallMatch[1] && !STOPWORDS.has(hallMatch[1].toLowerCase().trim())) {
+    hallNumber = hallMatch[1].trim();
+  }
+  if (!address && (hallNumber || boothNumber)) {
+    address = [hallNumber ? `Hall ${hallNumber}` : null, boothNumber ? `Booth ${boothNumber}` : null].filter(Boolean).join(' / ');
   }
 
   return {
+    rawName: companyName || undefined,
     companyName: companyName || undefined,
+    boothNumber,
+    hallNumber,
+    category: industry,
+    detailUrl,
     contactName,
     contactTitle,
     email,
@@ -566,13 +696,17 @@ export async function extractFromDirectory(
 
   // 4. Dynamic Playwright rendering if dynamic frames, iframes, or JS SPA detected
   const targetUrlToRender = classification.detectedIframeUrl || url;
+  const initialCardsCount = extractCardsFromHtml(initialHtml, finalUrl, organizerEmails, organizerPhones).length;
   const needsDynamic = 
     Boolean(classification.detectedIframeUrl) ||
     initialHtml.includes('iframeForm') ||
     initialHtml.includes('iframeUrl=') ||
     initialHtml.includes('<iframe') ||
-    initialHtml.includes('<div id="__next"></div>') ||
-    initialHtml.includes('<div id="root"></div>') ||
+    initialHtml.includes('<div id="__next">') ||
+    initialHtml.includes('<div id="root">') ||
+    initialHtml.includes('Vue.component') ||
+    initialHtml.includes('mapyourshow') ||
+    (initialCardsCount < 5 && initialHtml.includes('<script')) ||
     initialHtml.length < 2000;
 
   if (needsDynamic) {
@@ -771,7 +905,12 @@ export async function extractFromDirectory(
         detailUrlsToVisit.push({ card, detailUrl: card.detailUrl });
       } else {
         registerLead({
+          rawName: card.companyName,
           companyName: card.companyName,
+          boothNumber: card.boothNumber,
+          hallNumber: card.hallNumber,
+          category: card.category,
+          sourceUrl: finalUrl,
           email: card.email,
           phone: card.phone,
           industry: card.category,
@@ -824,7 +963,13 @@ export async function extractFromDirectory(
       }
 
       const mergedLead: Partial<ExtractedRawLead> = {
+        rawName: detailLeadData.rawName || item.card.companyName,
         companyName: detailLeadData.companyName || item.card.companyName,
+        boothNumber: detailLeadData.boothNumber || item.card.boothNumber,
+        hallNumber: detailLeadData.hallNumber || item.card.hallNumber,
+        category: detailLeadData.category || item.card.category,
+        detailUrl: validatedDetailUrl,
+        sourceUrl: finalUrl,
         contactName: detailLeadData.contactName,
         contactTitle: detailLeadData.contactTitle,
         email: detailLeadData.email || item.card.email,

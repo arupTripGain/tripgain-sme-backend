@@ -3,6 +3,8 @@ import { PrismaClient } from '@prisma/client';
 import { extractFromCsv, extractFromXlsx, extractFromPdf, extractFromPastedText, extractFromWebsite, ExtractionResult } from './extractionService';
 import { normalizeLeadPayload } from './normalizationService';
 import { evaluateDuplicate, createBatchDeduplicator } from './deduplicationService';
+import { companyResolutionService } from './companyResolutionService';
+import { tavilySearchResolver } from './search/tavilySearchResolver';
 
 const prisma = new PrismaClient();
 
@@ -56,6 +58,11 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         status: 'DISCOVERING',
       },
     });
+  } else {
+    await prisma.leadIntelligenceResearchBatch.update({
+      where: { id: batch.id },
+      data: { status: 'DISCOVERING' },
+    });
   }
 
   // Live progress callback
@@ -92,6 +99,11 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
 
   try {
     let extraction: ExtractionResult;
+
+    await prisma.leadIntelligenceResearchBatch.update({
+      where: { id: batch.id },
+      data: { status: 'EXTRACTING' },
+    }).catch(() => {});
 
     switch (sourceType) {
       case 'CSV':
@@ -143,7 +155,6 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         },
       });
 
-      // Persist raw record indicating needs OCR
       const firstRaw = extraction.rawRecords[0];
       if (firstRaw) {
         await prisma.leadIntelligenceRawRecord.create({
@@ -188,10 +199,20 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
       };
     }
 
-    // 2. Persist Raw Records & Normalization / Deduplication
+    // 2. Normalizing & Deduplicating Stage
+    await prisma.leadIntelligenceResearchBatch.update({
+      where: { id: batch.id },
+      data: { status: 'NORMALIZING' },
+    }).catch(() => {});
+
     let validCount = 0;
     let duplicateCount = 0;
     let errorCount = 0;
+
+    let domainsFound = 0;
+    let domainsResolved = 0;
+    let domainsUnresolved = 0;
+    let reviewRequired = 0;
 
     const deduplicator = await createBatchDeduplicator(userId, workspaceId);
 
@@ -202,7 +223,7 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
     }
 
     const rawRecordsToInsert: any[] = [];
-    const leadsToInsert: any[] = [];
+    const normalizedLeads: any[] = [];
 
     for (let i = 0; i < extraction.rawRecords.length; i++) {
       const raw = extraction.rawRecords[i];
@@ -231,7 +252,13 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
 
       // 3. Normalization pass
       const normalized = normalizeLeadPayload({
+        rawName: leadItem.rawName || leadItem.companyName,
         companyName: leadItem.companyName,
+        boothNumber: leadItem.boothNumber,
+        hallNumber: leadItem.hallNumber,
+        category: leadItem.category,
+        detailUrl: leadItem.detailUrl,
+        sourceUrl: leadItem.sourceUrl || url,
         domain: leadItem.domain || leadItem.websiteUrl || undefined,
         websiteUrl: leadItem.websiteUrl || undefined,
         contactName: leadItem.contactName || undefined,
@@ -254,7 +281,22 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         },
       });
 
-      // 4. In-memory Deduplication evaluation
+      normalizedLeads.push({
+        leadItem,
+        normalized,
+        rawRecordId,
+      });
+    }
+
+    // 4. Deduplication Stage
+    await prisma.leadIntelligenceResearchBatch.update({
+      where: { id: batch.id },
+      data: { status: 'DEDUPLICATING' },
+    }).catch(() => {});
+
+    const deduplicatedItems: any[] = [];
+    for (const item of normalizedLeads) {
+      const { normalized, rawRecordId, leadItem } = item;
       const dedupe = deduplicator.evaluate({
         domain: normalized.domain,
         email: normalized.email,
@@ -281,7 +323,54 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         });
       }
 
-      // 5. Collect normalized Lead record for bulk insertion
+      deduplicatedItems.push({
+        leadId,
+        leadItem,
+        normalized,
+        rawRecordId,
+        dedupe,
+      });
+    }
+
+    // 5. Company Domain Resolution Stage
+    await prisma.leadIntelligenceResearchBatch.update({
+      where: { id: batch.id },
+      data: { status: 'RESOLVING_DOMAINS' },
+    }).catch(() => {});
+
+    companyResolutionService.clearCache();
+    const leadsToInsert: any[] = [];
+
+    for (const item of deduplicatedItems) {
+      const { leadId, leadItem, normalized, rawRecordId, dedupe } = item;
+
+      // Run evidence-based company resolution
+      const resolution = await companyResolutionService.resolveCompany({
+        rawName: normalized.rawName,
+        companyName: normalized.companyName,
+        companyNormalizedName: normalized.companyNormalizedName,
+        websiteUrl: normalized.websiteUrl,
+        domain: normalized.domain,
+        city: normalized.city,
+        category: normalized.category,
+        sourceUrl: normalized.sourceUrl,
+        userId,
+        workspaceId: workspaceId || null,
+        searchResolver: tavilySearchResolver,
+      });
+
+      // Update counters based on resolution evidence
+      if (resolution.resolutionSource === 'DIRECTORY') {
+        domainsFound++;
+      }
+      if (resolution.resolutionStatus === 'RESOLVED_HIGH' || resolution.resolutionStatus === 'RESOLVED_MEDIUM') {
+        domainsResolved++;
+      } else if (resolution.resolutionStatus === 'REVIEW_REQUIRED') {
+        reviewRequired++;
+      } else if (resolution.resolutionStatus === 'UNRESOLVED') {
+        domainsUnresolved++;
+      }
+
       leadsToInsert.push({
         id: leadId,
         userId,
@@ -289,10 +378,20 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         sourceId,
         batchId: batch.id,
         rawRecordId,
+        rawName: normalized.rawName,
         companyName: normalized.companyName,
         companyNormalizedName: normalized.companyNormalizedName,
-        domain: normalized.domain,
-        websiteUrl: normalized.websiteUrl,
+        domain: resolution.domain || normalized.domain,
+        websiteUrl: resolution.websiteUrl || normalized.websiteUrl,
+        boothNumber: normalized.boothNumber,
+        hallNumber: normalized.hallNumber,
+        category: normalized.category,
+        detailUrl: normalized.detailUrl,
+        sourceUrl: normalized.sourceUrl,
+        resolutionStatus: resolution.resolutionStatus,
+        resolutionSource: resolution.resolutionSource,
+        resolutionEvidence: resolution.resolutionEvidence as any,
+        resolvedAt: resolution.resolvedAt,
         industry: normalized.industry,
         companySize: normalized.companySize,
         contactName: normalized.contactName,
@@ -313,7 +412,7 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         duplicateLeadId: dedupe.duplicateLeadId,
         hasValidEmail: normalized.hasValidEmail,
         hasValidPhone: normalized.hasValidPhone,
-        hasValidDomain: normalized.hasValidDomain,
+        hasValidDomain: Boolean(resolution.domain || normalized.hasValidDomain),
         completenessScore: normalized.completenessScore,
       });
     }
@@ -325,15 +424,39 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
       await prisma.leadIntelligenceRawRecord.createMany({ data: chunk });
     }
 
+    // Check existing leads in batch to prevent duplication upon resume/worker restart
+    const existingLeadsInBatch = await prisma.leadIntelligenceLead.findMany({
+      where: { batchId: batch.id },
+      select: { companyNormalizedName: true, domain: true },
+    });
+    const existingCompanyNames = new Set(
+      existingLeadsInBatch.map((l) => l.companyNormalizedName).filter(Boolean) as string[]
+    );
+    const existingDomains = new Set(
+      existingLeadsInBatch.map((l) => l.domain).filter(Boolean) as string[]
+    );
+
+    const newLeadsToInsert = leadsToInsert.filter((l) => {
+      if (l.companyNormalizedName && existingCompanyNames.has(l.companyNormalizedName)) {
+        return false;
+      }
+      if (l.domain && existingDomains.has(l.domain)) {
+        return false;
+      }
+      if (l.companyNormalizedName) existingCompanyNames.add(l.companyNormalizedName);
+      if (l.domain) existingDomains.add(l.domain);
+      return true;
+    });
+
     // 7. Bulk insert Leads in chunks of 200
-    for (let c = 0; c < leadsToInsert.length; c += CHUNK_SIZE) {
-      const chunk = leadsToInsert.slice(c, c + CHUNK_SIZE);
+    for (let c = 0; c < newLeadsToInsert.length; c += CHUNK_SIZE) {
+      const chunk = newLeadsToInsert.slice(c, c + CHUNK_SIZE);
       await prisma.leadIntelligenceLead.createMany({ data: chunk });
     }
 
     const finalStatus = errorCount > 0 && validCount > 0 ? 'PARTIAL' : (validCount > 0 || duplicateCount > 0 ? 'COMPLETED' : 'FAILED');
 
-    // 6. Update Source counts and final status
+    // 8. Update Source counts and final status
     await prisma.leadIntelligenceSource.update({
       where: { id: sourceId },
       data: {
@@ -346,11 +469,13 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
       },
     });
 
-    // 7. Update Research Batch with complete final statistics
+    const finalBatchStatus = reviewRequired > 0 ? 'REVIEW_REQUIRED' : finalStatus;
+
+    // 9. Update Research Batch with complete final statistics
     await prisma.leadIntelligenceResearchBatch.update({
       where: { id: batch.id },
       data: {
-        status: finalStatus,
+        status: finalBatchStatus,
         completedAt: new Date(),
         totalPages: extraction.metrics?.totalPages || 1,
         pagesProcessed: extraction.metrics?.pagesProcessed || 1,
@@ -358,6 +483,10 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
         recordsProcessed: validCount + duplicateCount + errorCount,
         uniqueRecords: validCount,
         duplicateRecords: duplicateCount,
+        domainsFound,
+        domainsResolved,
+        domainsUnresolved,
+        reviewRequired,
         failedRecords: errorCount + (extraction.metrics?.failedPages || 0),
         requestCount: extraction.metrics?.requestsMade || 1,
         errorMessage: extraction.errorMessage || (errorCount > 0 ? `${errorCount} row(s) failed validation` : null),
@@ -365,12 +494,16 @@ export async function processLeadIntelligencePipeline(options: ProcessSourceOpti
     });
 
     return {
-      status: finalStatus,
+      status: finalBatchStatus,
       batchId: batch.id,
       totalRecords: validCount + duplicateCount + errorCount,
       validCount,
       duplicateCount,
       errorCount,
+      domainsFound,
+      domainsResolved,
+      domainsUnresolved,
+      reviewRequired,
       metrics: extraction.metrics,
       pageType: extraction.pageType,
     };

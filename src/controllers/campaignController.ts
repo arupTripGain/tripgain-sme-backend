@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { OwnershipGuard } from '../utils/ownershipGuard';
+import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
 
 const prisma = new PrismaClient();
 
@@ -47,14 +48,16 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
       include: {
         sequences: {
           include: {
-            steps: true
+            steps: {
+              orderBy: { stepNumber: 'asc' }
+            }
           }
         },
         enrollments: {
-          select: { id: true, status: true }
+          select: { id: true, status: true, currentStep: true }
         },
         messages: {
-          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true }
+          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
         },
         events: {
           select: { id: true, eventType: true }
@@ -87,6 +90,8 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
       const senderEmail = c.senderMailboxes?.[0] || null;
       const replyToEmail = c.replyToEmail || senderEmail;
 
+      const { stepProgress, campaignCompletion } = calculateCampaignStepProgressAndCompletion(c);
+
       return {
         ...c,
         enrolledCount,
@@ -98,6 +103,8 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
         replyRate,
         senderEmail,
         replyToEmail,
+        stepProgress,
+        campaignCompletion,
         _count: {
           enrollments: enrolledCount,
           sequences: c.sequences.length,
@@ -131,6 +138,12 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
             }
           }
         },
+        enrollments: {
+          select: { id: true, status: true, currentStep: true }
+        },
+        messages: {
+          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
+        },
         _count: {
           select: { enrollments: true }
         }
@@ -160,6 +173,8 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
     const senderEmail = fullCampaign.senderMailboxes?.[0] || null;
     const replyToEmail = fullCampaign.replyToEmail || senderEmail;
     
+    const { stepProgress, campaignCompletion } = calculateCampaignStepProgressAndCompletion(fullCampaign);
+
     res.status(200).json({
       ...fullCampaign,
       enrolledCount: fullCampaign._count.enrollments,
@@ -168,7 +183,9 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
       totalSentMessages: sentCount,
       repliesCount: repliedCount,
       senderEmail,
-      replyToEmail
+      replyToEmail,
+      stepProgress,
+      campaignCompletion
     });
   } catch (error) {
     console.error('Error fetching campaign:', error);

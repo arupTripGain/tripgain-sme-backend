@@ -827,6 +827,10 @@ model LeadIntelligenceResearchBatch {
   duplicateRecords  Int       @default(0)
   failedRecords     Int       @default(0)
   requestCount      Int       @default(0)
+  domainsFound      Int       @default(0)
+  domainsResolved   Int       @default(0)
+  domainsUnresolved Int       @default(0)
+  reviewRequired    Int       @default(0)
   errorMessage      String?
   metadata          Json?
   createdAt         DateTime  @default(now())
@@ -875,6 +879,18 @@ model LeadIntelligenceLead {
   websiteUrl            String?
   industry              String?
   companySize           String?
+
+  // Exhibitor & Resolution Attributes (Sprint 1)
+  rawName               String?
+  boothNumber           String?
+  hallNumber            String?
+  category              String?
+  detailUrl             String?
+  sourceUrl             String?
+  resolutionStatus      String    @default("UNRESOLVED") // UNRESOLVED, RESOLVED_HIGH, RESOLVED_MEDIUM, RESOLVED_LOW, REVIEW_REQUIRED
+  resolutionSource      String?   // DIRECTORY, DATABASE, SEARCH, MANUAL
+  resolutionEvidence    Json?     // { source, evidence, candidateDomain, candidates: [], criteriaMatched: [] }
+  resolvedAt            DateTime?
   
   // Contact Attributes
   contactName           String?
@@ -923,6 +939,7 @@ model LeadIntelligenceLead {
   @@index([userId, email])
   @@index([sourceId])
   @@index([batchId])
+  @@index([batchId, resolutionStatus])
 }
 
 // ==================================================
@@ -985,6 +1002,8 @@ model EmailVerificationResult {
 
   smtpResponseCode   String?
   smtpResponse       String?
+  confidence         Float?
+  verifierVersion    String?
 
   verifiedAt         DateTime @default(now())
   expiresAt          DateTime
@@ -999,4 +1018,18 @@ model EmailVerificationResult {
   @@index([jobId, result])
   @@index([normalizedEmail, expiresAt])
   @@index([contactId])
+}
+
+model ListGuardWorker {
+  id              String   @id @default(uuid())
+  workerId        String   @unique
+  status          String
+  version         String
+  hostname        String?
+  activeJobs      Int      @default(0)
+  currentJobId    String?
+  startedAt       DateTime @default(now())
+  lastHeartbeatAt DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 }

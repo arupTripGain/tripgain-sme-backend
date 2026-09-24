@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
 import { ListGuardQueue } from '../src/services/listGuard/listGuardQueue';
 import { ListGuardStore } from '../src/services/listGuard/listGuardStore';
+import { ListGuardWorker } from '../src/workers/listGuardWorker';
 import { setTestSmtpMockHandler } from '../src/services/listGuard/smtpVerifier';
 import {
   getDashboard,
@@ -17,7 +18,12 @@ import {
   getListHistory
 } from '../src/controllers/listGuardController';
 
-const prisma = new PrismaClient();
+const TEST_DATABASE_URL = "postgresql://neondb_owner:npg_KRSH2nqwsjL0@ep-snowy-cell-b3gndpl3-pooler.c-4.ap-southeast-1.aws.neon.tech/listguard_test_db?sslmode=require&channel_binding=require";
+process.env.DATABASE_URL = TEST_DATABASE_URL;
+
+const prisma = new PrismaClient({
+  datasources: { db: { url: TEST_DATABASE_URL } }
+});
 const JWT_SECRET = process.env.JWT_SECRET || 'tripgain_dev_jwt_secret_change_in_production';
 
 function createMockReqRes(options: {
@@ -100,6 +106,10 @@ async function runListGuardJobsAndSecurityTests() {
       throw err;
     }
   }
+
+  // Clean up any lingering jobs from previous test runs in test DB
+  await prisma.emailVerificationResult.deleteMany({}).catch(() => {});
+  await prisma.emailVerificationJob.deleteMany({}).catch(() => {});
 
   // Setup test users & workspace
   const userA = await prisma.user.upsert({
@@ -255,8 +265,12 @@ async function runListGuardJobsAndSecurityTests() {
   });
 
   await test('GET /api/listguard/jobs/:jobId reports job progress & completes correctly', async () => {
-    // Wait briefly for the worker queue to process the 3 items
-    await new Promise((r) => setTimeout(r, 2000));
+    // Process job using dedicated ListGuardWorker
+    const testWorker = new ListGuardWorker({ prisma });
+    const targetJob = await ListGuardStore.findJobById(prisma, createdJobId);
+    if (targetJob) {
+      await testWorker.processJob(targetJob);
+    }
 
     const { req, res } = createMockReqRes({
       token: tokenA,

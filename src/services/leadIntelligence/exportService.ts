@@ -8,6 +8,52 @@ export function escapeCsvField(val: any): string {
 }
 
 /**
+ * Clean 12-column Company-Level CSV Export for Sprint 1 Exhibitor Intelligence
+ */
+export function generateCompanyExhibitorCsv(leads: any[], batchSourceUrl?: string | null): string {
+  const headers = [
+    'Company Name',
+    'Normalized Company Name',
+    'Website',
+    'Domain',
+    'Resolution Status',
+    'Resolution Source',
+    'Resolution Evidence',
+    'Booth Number',
+    'Hall Number',
+    'Category',
+    'Source URL',
+  ];
+
+  const rows = leads.map((lead) => {
+    let evidenceStr = '';
+    if (lead.resolutionEvidence) {
+      if (typeof lead.resolutionEvidence === 'object') {
+        evidenceStr = lead.resolutionEvidence.evidence || JSON.stringify(lead.resolutionEvidence);
+      } else {
+        evidenceStr = String(lead.resolutionEvidence);
+      }
+    }
+
+    return [
+      escapeCsvField(lead.companyName || lead.rawName || ''),
+      escapeCsvField(lead.companyNormalizedName || ''),
+      escapeCsvField(lead.websiteUrl || ''),
+      escapeCsvField(lead.domain || ''),
+      escapeCsvField(lead.resolutionStatus || 'UNRESOLVED'),
+      escapeCsvField(lead.resolutionSource || ''),
+      escapeCsvField(evidenceStr),
+      escapeCsvField(lead.boothNumber || ''),
+      escapeCsvField(lead.hallNumber || ''),
+      escapeCsvField(lead.category || lead.industry || ''),
+      escapeCsvField(lead.sourceUrl || lead.detailUrl || batchSourceUrl || ''),
+    ];
+  });
+
+  return '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
+}
+
+/**
  * Standard CSV export for general Lead Intelligence records
  */
 export function generateLeadsCsv(leads: any[]): string {

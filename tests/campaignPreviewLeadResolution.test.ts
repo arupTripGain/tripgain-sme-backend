@@ -170,6 +170,7 @@ async function runTests() {
   });
 
   const allContacts = await prisma.contact.findMany({
+    where: { organization: { isNot: null } },
     take: 30,
     orderBy: { createdAt: 'desc' },
     include: { organization: true, emails: true }

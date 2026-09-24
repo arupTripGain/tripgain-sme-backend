@@ -137,13 +137,28 @@ export class OwnershipGuard {
     const user = this.requireUser(req, res);
     if (!user) return null;
 
+    if (user.role === 'ADMIN') {
+      const conv = await prisma.conversation.findUnique({
+        where: { id: conversationId }
+      });
+      if (!conv) {
+        res.status(404).json({ error: 'Conversation not found' });
+        return null;
+      }
+      return conv;
+    }
+
     const conversation = await prisma.conversation.findFirst({
       where: {
         id: conversationId,
         OR: [
           { campaign: { userId: user.userId } },
+          ...(user.name ? [{ campaign: { owner: user.name } }] : []),
+          ...(user.email ? [{ campaign: { owner: user.email } }] : []),
           { mailbox: { userId: user.userId } },
-          { assignedTo: user.userId }
+          { contact: { userId: user.userId } },
+          { assignedTo: user.userId },
+          ...(user.email ? [{ assignedTo: user.email }] : [])
         ]
       }
     });

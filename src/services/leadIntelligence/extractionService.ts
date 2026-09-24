@@ -9,7 +9,13 @@ export interface ExtractedRawLead {
   rowNumber?: number | undefined;
   rawText?: string | undefined;
   rawData?: Record<string, any> | undefined;
+  rawName?: string | undefined;
   companyName?: string | undefined;
+  boothNumber?: string | null | undefined;
+  hallNumber?: string | null | undefined;
+  category?: string | null | undefined;
+  detailUrl?: string | null | undefined;
+  sourceUrl?: string | null | undefined;
   contactName?: string | null | undefined;
   contactTitle?: string | null | undefined;
   email?: string | null | undefined;

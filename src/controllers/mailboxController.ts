@@ -368,6 +368,33 @@ export const disconnectMailbox = async (req: Request, res: Response): Promise<vo
       where: { mailboxId: mailbox.id }
     });
 
+    // Check if mailbox has messages or enrollments
+    const [enrollmentCount, messageCount] = await Promise.all([
+      prisma.enrollment.count({ where: { mailboxId: mailbox.id } }),
+      prisma.emailMessage.count({ where: { fromEmail: { equals: mailbox.email, mode: 'insensitive' } } })
+    ]);
+
+    // If mailbox is already disconnected or has zero active dependencies, delete it completely
+    if (mailbox.status === 'DISCONNECTED' || (enrollmentCount === 0 && messageCount === 0)) {
+      const campaigns = await prisma.campaign.findMany({
+        select: { id: true, senderMailboxes: true }
+      });
+      for (const camp of campaigns) {
+        const orig = camp.senderMailboxes || [];
+        const filtered = orig.filter(ref => ref !== mailbox.id && ref !== mailbox.email);
+        if (filtered.length !== orig.length) {
+          await prisma.campaign.update({
+            where: { id: camp.id },
+            data: { senderMailboxes: filtered }
+          });
+        }
+      }
+
+      await prisma.mailbox.delete({ where: { id: mailbox.id } });
+      res.status(200).json({ success: true, deleted: true, id: mailbox.id });
+      return;
+    }
+
     // Update mailbox status
     const updated = await prisma.mailbox.update({
       where: { id: mailbox.id },

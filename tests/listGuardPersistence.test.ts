@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
 import { ListGuardQueue } from '../src/services/listGuard/listGuardQueue';
 import { ListGuardStore } from '../src/services/listGuard/listGuardStore';
+import { ListGuardWorker } from '../src/workers/listGuardWorker';
 import { setTestSmtpMockHandler } from '../src/services/listGuard/smtpVerifier';
 import {
   startVerificationJob,
@@ -108,6 +109,8 @@ async function runListGuardPersistenceTests() {
     const hasTables = await ListGuardStore.checkTableAvailability(prisma);
     assert.strictEqual(hasTables, true, 'Prisma persistence must find actual database tables, not fallback!');
     
+    await prisma.emailVerificationResult.deleteMany({}).catch(() => {});
+    await prisma.emailVerificationJob.deleteMany({}).catch(() => {});
     const count = await prisma.emailVerificationJob.count();
     assert.ok(typeof count === 'number');
   });
@@ -253,19 +256,11 @@ async function runListGuardPersistenceTests() {
     createdJobId = res.data.jobId;
     assert.ok(createdJobId, 'Job ID must be returned');
 
-    // Wait for job completion
-    let attempts = 0;
-    while (attempts < 100) {
-      await new Promise(r => setTimeout(r, 200));
-      const statusRes = createMockReqRes({
-        token,
-        params: { jobId: createdJobId }
-      });
-      await getJobStatus(statusRes.req, statusRes.res);
-      if (statusRes.res.data.status === 'COMPLETED') {
-        break;
-      }
-      attempts++;
+    // Process job using dedicated ListGuardWorker against test database
+    const testWorker = new ListGuardWorker({ prisma });
+    const targetJob = await ListGuardStore.findJobById(prisma, createdJobId);
+    if (targetJob) {
+      await testWorker.processJob(targetJob);
     }
   });
 

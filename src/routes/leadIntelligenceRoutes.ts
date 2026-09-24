@@ -20,6 +20,7 @@ import {
   getLeads,
   getLeadDetail,
   overrideDedupeStatus,
+  reviewCompanyResolution,
   exportLeadsCsv,
   getBatches,
   getBatchDetail,
@@ -53,6 +54,7 @@ router.get('/sources/:id', getSourceDetail);
 router.get('/leads', getLeads);
 router.get('/leads/:id', getLeadDetail);
 router.post('/leads/:id/override-dedupe', overrideDedupeStatus);
+router.post('/leads/:id/review-resolution', reviewCompanyResolution);
 
 // Export Endpoint
 router.get('/export', exportLeadsCsv);

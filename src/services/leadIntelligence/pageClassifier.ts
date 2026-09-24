@@ -110,11 +110,18 @@ export function classifyPage(html: string, url: string): PageClassification {
     }
   });
 
-  // 2. Keyword signals in URL or title
+  // 2. Keyword signals in URL path, hash, or title
   const hasDirKeywordInUrl = DIRECTORY_KEYWORDS.some(k => pathname.includes(k));
   if (hasDirKeywordInUrl) {
     directoryScore += 30;
     reasons.push('URL path contains directory keywords');
+  }
+
+  const hash = parsedUrl.hash.toLowerCase();
+  const hasDirKeywordInHash = DIRECTORY_KEYWORDS.some(k => hash.includes(k));
+  if (hasDirKeywordInHash) {
+    directoryScore += 35;
+    reasons.push(`URL fragment/hash (${parsedUrl.hash}) contains directory keywords`);
   }
 
   const hasDirKeywordInTitle = DIRECTORY_KEYWORDS.some(k => title.includes(k));
@@ -123,7 +130,20 @@ export function classifyPage(html: string, url: string): PageClassification {
     reasons.push('Title contains directory keywords');
   }
 
+  // 2b. Check dedicated DOM sections for exhibitor directory patterns
+  const exhibitorSections = $('[id*="exhibitor"], [class*="exhibitor-section"], [class*="exhibitor-list"], [id*="directory"]');
+  if (exhibitorSections.length > 0) {
+    directoryScore += 25;
+    reasons.push('DOM contains dedicated exhibitor/directory sections');
+  }
+
   // 3. Repeated container cards, rows, or list elements
+  const specificExhibitorCards = $('[class*="exhibitor-card"], [class*="exhibitor-item"], [class*="exhibitor_card"], [class*="exhibitor_item"]');
+  if (specificExhibitorCards.length >= 10) {
+    directoryScore += 40;
+    reasons.push(`Detected ${specificExhibitorCards.length} dedicated exhibitor card elements`);
+  }
+
   const cards = $('.card, article, [class*="card"], [class*="item"], [class*="exhibitor"], tr, li');
   if (cards.length >= 5) {
     directoryScore += 25;
