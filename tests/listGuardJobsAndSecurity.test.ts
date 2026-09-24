@@ -18,7 +18,10 @@ import {
   getListHistory
 } from '../src/controllers/listGuardController';
 
-const TEST_DATABASE_URL = "postgresql://neondb_owner:npg_KRSH2nqwsjL0@ep-snowy-cell-b3gndpl3-pooler.c-4.ap-southeast-1.aws.neon.tech/listguard_test_db?sslmode=require&channel_binding=require";
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
+if (!TEST_DATABASE_URL) {
+  throw new Error('DATABASE_URL or TEST_DATABASE_URL environment variable must be set');
+}
 process.env.DATABASE_URL = TEST_DATABASE_URL;
 
 const prisma = new PrismaClient({
