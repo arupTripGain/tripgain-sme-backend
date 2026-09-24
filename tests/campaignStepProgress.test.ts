@@ -390,7 +390,80 @@ function runTests() {
     console.log('✓ Test 16: Multiple campaigns return independent step statistics passed');
   }
 
-  console.log('\n ALL 16 CAMPAIGN STEP PROGRESS TESTS PASSED SUCCESSFULLY! \n');
+  // Test 17: Legacy campaigns with null sequenceStepId on earlier steps
+  {
+    const campaign = {
+      sequences: [{
+        steps: [
+          { id: 's1', stepNumber: 1, stepName: 'Initial Outreach' },
+          { id: 's2', stepNumber: 2, stepName: 'Follow-up' },
+          { id: 's3', stepNumber: 3, stepName: 'Final Follow-up' }
+        ]
+      }],
+      enrollments: [
+        { id: 'e1', status: 'completed', currentStep: 3 },
+        { id: 'e2', status: 'active', currentStep: 3 },
+        { id: 'e3', status: 'active', currentStep: 2 }
+      ],
+      messages: [
+        // e1 received 3 messages chronologically (legacy: sequenceStepId was null)
+        { id: 'm1-1', sequenceStepId: null, enrollmentId: 'e1', status: 'sent', sentAt: new Date(2026, 8, 15, 10, 0) },
+        { id: 'm1-2', sequenceStepId: null, enrollmentId: 'e1', status: 'sent', sentAt: new Date(2026, 8, 18, 10, 0) },
+        { id: 'm1-3', sequenceStepId: 's3', enrollmentId: 'e1', status: 'sent', sentAt: new Date(2026, 8, 21, 10, 0) },
+        // e2 received 2 legacy messages
+        { id: 'm2-1', sequenceStepId: null, enrollmentId: 'e2', status: 'sent', sentAt: new Date(2026, 8, 15, 10, 0) },
+        { id: 'm2-2', sequenceStepId: null, enrollmentId: 'e2', status: 'sent', sentAt: new Date(2026, 8, 18, 10, 0) },
+        // e3 received 1 legacy message
+        { id: 'm3-1', sequenceStepId: null, enrollmentId: 'e3', status: 'sent', sentAt: new Date(2026, 8, 15, 10, 0) }
+      ]
+    };
+    const res = calculateCampaignStepProgressAndCompletion(campaign);
+    // Step 1: all 3 sent
+    assert.strictEqual(res.stepProgress[0]!.sentCount, 3, 'Step 1 should have 3 sent');
+    // Step 2: e1 (has 3 msgs), e2 (has 2 msgs and currentStep 3), e3 (currentStep 2)
+    assert.strictEqual(res.stepProgress[1]!.sentCount >= 2, true, 'Step 2 sent count should be at least 2');
+    // Step 3: e1 sent, e2 reached step 3
+    assert.strictEqual(res.stepProgress[2]!.sentCount >= 1, true, 'Step 3 sent count should be at least 1');
+    // Monotonic invariant: Step 1 >= Step 2 >= Step 3
+    assert.strictEqual(res.stepProgress[0]!.sentCount >= res.stepProgress[1]!.sentCount, true, 'Step 1 count >= Step 2 count');
+    assert.strictEqual(res.stepProgress[1]!.sentCount >= res.stepProgress[2]!.sentCount, true, 'Step 2 count >= Step 3 count (no step 2 zero while step 3 active)');
+    console.log('✓ Test 17: Legacy campaigns with null sequenceStepId handled monotonically passed');
+  }
+
+  // Test 18: Step 2 count is strictly higher than or equal to Step 3 count when Step 3 is active
+  {
+    const campaign = {
+      sequences: [{
+        steps: [
+          { id: 's1', stepNumber: 1, stepName: 'Step 1' },
+          { id: 's2', stepNumber: 2, stepName: 'Step 2' },
+          { id: 's3', stepNumber: 3, stepName: 'Step 3' }
+        ]
+      }],
+      enrollments: Array.from({ length: 50 }, (_, i) => ({
+        id: `e-${i}`,
+        status: i < 10 ? 'completed' : 'active',
+        currentStep: i < 15 ? 3 : 2
+      })),
+      messages: [
+        // 11 messages with step s3
+        ...Array.from({ length: 11 }, (_, i) => ({
+          id: `m-s3-${i}`,
+          sequenceStepId: 's3',
+          enrollmentId: `e-${i}`,
+          status: 'sent',
+          sentAt: new Date()
+        }))
+      ]
+    };
+    const res = calculateCampaignStepProgressAndCompletion(campaign);
+    assert.strictEqual(res.stepProgress[0]!.sentCount >= res.stepProgress[1]!.sentCount, true);
+    assert.strictEqual(res.stepProgress[1]!.sentCount >= res.stepProgress[2]!.sentCount, true);
+    assert.strictEqual(res.stepProgress[1]!.sentCount > 0, true, 'Step 2 must not be zero when Step 3 has sent messages');
+    console.log('✓ Test 18: Step 2 count is strictly >= Step 3 count passed');
+  }
+
+  console.log('\n ALL 18 CAMPAIGN STEP PROGRESS TESTS PASSED SUCCESSFULLY! \n');
 }
 
 runTests();

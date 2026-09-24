@@ -16,7 +16,6 @@
     "dev": "nodemon src/index.ts",
     "test": "ts-node tests/rotationService.test.ts && ts-node tests/schedulerAuth.test.ts && ts-node tests/schedulerOptimization.test.ts && ts-node tests/schedulerConcurrencyAndLocking.test.ts && ts-node tests/sequenceSubjectAndThreading.test.ts && ts-node tests/outreachAnalytics.test.ts && ts-node tests/multiUserDataIsolation.test.ts && ts-node tests/byokGeminiAi.test.ts && ts-node tests/campaignPreviewLeadResolution.test.ts && ts-node tests/businessDayScheduler.test.ts && ts-node tests/sendingQueue.test.ts",
     "test:lead-intel": "ts-node tests/leadIntelligence.test.ts",
-    "worker:listguard": "ts-node src/workers/listGuardWorker.ts",
     "postinstall": "prisma generate"
   },
   "keywords": [],

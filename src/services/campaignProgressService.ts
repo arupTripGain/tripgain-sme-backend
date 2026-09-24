@@ -97,6 +97,7 @@ export function calculateCampaignStepProgressAndCompletion(campaign: {
     id: string;
     status: string;
     sentAt?: Date | string | null;
+    createdAt?: Date | string | null;
     sequenceStepId?: string | null;
     enrollmentId?: string | null;
     toEmail?: string | null;
@@ -123,62 +124,88 @@ export function calculateCampaignStepProgressAndCompletion(campaign: {
     };
   }
 
-  // 2. Index valid sent messages by stepId and enrollmentId/recipient
+  // 2. Index valid sent messages by stepNumber and recipient key
   // Ensures no duplicate counting of recipient per step
-  const stepSentRecipientsMap = new Map<string, Set<string>>();
+  const stepById = new Map<string, typeof steps[0]>();
+  const stepByNumber = new Map<number, typeof steps[0]>();
+  const stepSentRecipientsMap = new Map<number, Set<string>>();
+
   for (const s of steps) {
-    stepSentRecipientsMap.set(s.id, new Set());
+    stepById.set(s.id, s);
+    stepByNumber.set(s.stepNumber, s);
+    stepSentRecipientsMap.set(s.stepNumber, new Set());
   }
 
-  // Track which stepNumbers were sent for each enrollment
-  const enrollmentSentStepNumbers = new Map<string, Set<number>>();
-
-  const step1 = steps[0];
-  const laterStepIds = new Set(steps.slice(1).map(s => s.id));
-
+  // Group valid sent messages by recipient/enrollment key
+  const recipientMessagesMap = new Map<string, typeof messages>();
   for (const m of messages) {
     if (!isMessageSent(m)) continue;
-
     const recipientKey = m.enrollmentId || (m.toEmail ? m.toEmail.trim().toLowerCase() : null);
     if (!recipientKey) continue;
+    if (!recipientMessagesMap.has(recipientKey)) {
+      recipientMessagesMap.set(recipientKey, []);
+    }
+    recipientMessagesMap.get(recipientKey)!.push(m);
+  }
 
-    let targetStep = steps.find(s => s.id === m.sequenceStepId);
-    // If sequenceStepId is missing or unmapped, it is the initial outreach message (Step 1)
-    if (!targetStep && step1) {
-      targetStep = step1;
+  // For each recipient, map messages to steps chronologically
+  for (const [recipientKey, msgs] of recipientMessagesMap.entries()) {
+    // Sort messages chronologically
+    msgs.sort((a, b) => {
+      const timeA = a.sentAt ? new Date(a.sentAt).getTime() : (a.createdAt ? new Date(a.createdAt).getTime() : 0);
+      const timeB = b.sentAt ? new Date(b.sentAt).getTime() : (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+      return timeA - timeB;
+    });
+
+    const assignedStepNumbers = new Set<number>();
+
+    // Pass 1: Messages with explicit sequenceStepId matching a known step
+    for (const m of msgs) {
+      if (m.sequenceStepId && stepById.has(m.sequenceStepId)) {
+        const stepNum = stepById.get(m.sequenceStepId)!.stepNumber;
+        stepSentRecipientsMap.get(stepNum)?.add(recipientKey);
+        assignedStepNumbers.add(stepNum);
+        // Preceding steps were inherently sent
+        for (let prev = 1; prev < stepNum; prev++) {
+          stepSentRecipientsMap.get(prev)?.add(recipientKey);
+          assignedStepNumbers.add(prev);
+        }
+      }
     }
 
-    if (targetStep) {
-      if (!stepSentRecipientsMap.has(targetStep.id)) {
-        stepSentRecipientsMap.set(targetStep.id, new Set());
-      }
-      stepSentRecipientsMap.get(targetStep.id)!.add(recipientKey);
-
-      // If a message was sent for step > 1, the contact was inherently sent step 1
-      if (targetStep.stepNumber > 1 && step1) {
-        stepSentRecipientsMap.get(step1.id)!.add(recipientKey);
-      }
-
-      if (m.enrollmentId) {
-        if (!enrollmentSentStepNumbers.has(m.enrollmentId)) {
-          enrollmentSentStepNumbers.set(m.enrollmentId, new Set());
+    // Pass 2: Messages with unmapped or null sequenceStepId (legacy dispatches)
+    // Assign each to the earliest unassigned stepNumber chronologically
+    let nextUnassignedStep = 1;
+    for (const m of msgs) {
+      if (!m.sequenceStepId || !stepById.has(m.sequenceStepId)) {
+        while (assignedStepNumbers.has(nextUnassignedStep) && nextUnassignedStep <= steps.length) {
+          nextUnassignedStep++;
         }
-        enrollmentSentStepNumbers.get(m.enrollmentId)!.add(targetStep.stepNumber);
-        if (targetStep.stepNumber > 1 && step1) {
-          enrollmentSentStepNumbers.get(m.enrollmentId)!.add(step1.stepNumber);
+        const stepNum = Math.min(nextUnassignedStep, steps.length);
+        stepSentRecipientsMap.get(stepNum)?.add(recipientKey);
+        assignedStepNumbers.add(stepNum);
+        for (let prev = 1; prev < stepNum; prev++) {
+          stepSentRecipientsMap.get(prev)?.add(recipientKey);
+          assignedStepNumbers.add(prev);
         }
+        nextUnassignedStep++;
       }
     }
   }
 
-  // Also account for enrollments that advanced beyond Step 1
+  // Pass 3: Account for enrollment currentStep and completion progression
   for (const e of enrollments) {
-    if (e.currentStep && e.currentStep > 1 && step1) {
-      stepSentRecipientsMap.get(step1.id)!.add(e.id);
-      if (!enrollmentSentStepNumbers.has(e.id)) {
-        enrollmentSentStepNumbers.set(e.id, new Set());
+    const eKey = e.id;
+    const curStep = e.currentStep || 1;
+    // An enrollment that reached currentStep > 1 has completed all prior steps
+    for (let prev = 1; prev < curStep && prev <= steps.length; prev++) {
+      stepSentRecipientsMap.get(prev)?.add(eKey);
+    }
+    // If enrollment is marked completed, all steps were sent
+    if (e.status === 'completed') {
+      for (let s = 1; s <= steps.length; s++) {
+        stepSentRecipientsMap.get(s)?.add(eKey);
       }
-      enrollmentSentStepNumbers.get(e.id)!.add(step1.stepNumber);
     }
   }
 
@@ -189,7 +216,7 @@ export function calculateCampaignStepProgressAndCompletion(campaign: {
     const step = steps[i];
     if (!step) continue;
     const stepNumber = step.stepNumber;
-    const sentSet = stepSentRecipientsMap.get(step.id) || new Set();
+    const sentSet = stepSentRecipientsMap.get(stepNumber) || new Set();
     const sentCount = sentSet.size;
 
     // Step Name: from existing sequence step data, or sensible fallback if empty
@@ -242,11 +269,11 @@ export function calculateCampaignStepProgressAndCompletion(campaign: {
 
   const lastStep = steps[steps.length - 1];
   const lastStepNumber = lastStep?.stepNumber ?? 0;
-  const lastStepSentSet = lastStep ? (stepSentRecipientsMap.get(lastStep.id) || new Set()) : new Set<string>();
+  const lastStepSentSet = lastStep ? (stepSentRecipientsMap.get(lastStepNumber) || new Set()) : new Set<string>();
 
   const completedEnrollments = enrollments.filter(e => {
     if ((e.status || '').toLowerCase() === 'completed') return true;
-    if (enrollmentSentStepNumbers.get(e.id)?.has(lastStepNumber) || lastStepSentSet.has(e.id)) {
+    if (lastStepSentSet.has(e.id)) {
       return true;
     }
     return false;

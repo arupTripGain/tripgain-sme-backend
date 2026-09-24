@@ -57,7 +57,7 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
           select: { id: true, status: true, currentStep: true }
         },
         messages: {
-          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
+          select: { id: true, status: true, sentAt: true, createdAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
         },
         events: {
           select: { id: true, eventType: true }
@@ -142,7 +142,7 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
           select: { id: true, status: true, currentStep: true }
         },
         messages: {
-          select: { id: true, status: true, sentAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
+          select: { id: true, status: true, sentAt: true, createdAt: true, enrollmentId: true, toEmail: true, sequenceStepId: true }
         },
         _count: {
           select: { enrollments: true }
