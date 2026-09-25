@@ -228,6 +228,7 @@ model Campaign {
   workspaceId              String
   userId                   String?
   listId                   String?
+  listIds                  String[] @default([])
   name                     String
   campaignCode             String?
   description              String?

@@ -92,8 +92,13 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
 
       const { stepProgress, campaignCompletion } = calculateCampaignStepProgressAndCompletion(c);
 
+      const cListIds = ((c as any).listIds && (c as any).listIds.length > 0)
+        ? (c as any).listIds
+        : (c.listId ? [c.listId] : []);
+
       return {
         ...c,
+        listIds: cListIds,
         enrolledCount,
         stepsCount,
         sentCount,
@@ -175,8 +180,18 @@ export const getCampaignById = async (req: Request, res: Response): Promise<void
     
     const { stepProgress, campaignCompletion } = calculateCampaignStepProgressAndCompletion(fullCampaign);
 
+    const targetListIds = ((fullCampaign as any).listIds && (fullCampaign as any).listIds.length > 0)
+      ? (fullCampaign as any).listIds
+      : (fullCampaign.listId ? [fullCampaign.listId] : []);
+    const lists = targetListIds.length > 0 ? await prisma.list.findMany({
+      where: { id: { in: targetListIds } },
+      select: { id: true, name: true, listType: true }
+    }) : (fullCampaign.list ? [fullCampaign.list] : []);
+
     res.status(200).json({
       ...fullCampaign,
+      listIds: targetListIds,
+      lists,
       enrolledCount: fullCampaign._count.enrollments,
       stepsCount,
       sentCount,
@@ -201,7 +216,7 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
 
     const { 
       name, description, campaignCode, campaignType,
-      listId, audienceRules,
+      listId, listIds, audienceRules,
       senderMailboxes, replyToEmail,
       timezone, sendingDays, sendingWindowStart, sendingWindowEnd,
       dailySendLimit, hourlySendLimit, delayBetweenSendsSeconds,
@@ -212,10 +227,15 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
     
     const workspace = await getWorkspace(user.userId);
     
-    let targetListId = listId;
+    let targetListIds: string[] = [];
+    if (Array.isArray(listIds)) {
+      targetListIds = listIds.map(id => String(id).trim()).filter(Boolean);
+    } else if (listId) {
+      targetListIds = [String(listId).trim()];
+    }
 
-    if (targetListId) {
-      const list = await OwnershipGuard.assertList(req, res, targetListId);
+    for (const lid of targetListIds) {
+      const list = await OwnershipGuard.assertList(req, res, lid);
       if (!list) return;
     }
 
@@ -230,7 +250,7 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
           rules: audienceRules
         }
       });
-      targetListId = newList.id;
+      targetListIds = [newList.id];
     }
 
     const userId = user.userId;
@@ -246,7 +266,8 @@ export const composeCampaign = async (req: Request, res: Response): Promise<void
         campaignCode,
         description,
         campaignType: campaignType || 'email_outreach',
-        listId: targetListId || null,
+        listId: targetListIds[0] || null,
+        listIds: targetListIds,
         status: 'draft',
         approvalStatus: 'DRAFT',
         senderMailboxes: senderMailboxes || [],
@@ -317,7 +338,11 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    if (!fullCampaign.listId) {
+    const targetListIds = ((fullCampaign as any).listIds && (fullCampaign as any).listIds.length > 0)
+      ? (fullCampaign as any).listIds
+      : (fullCampaign.listId ? [fullCampaign.listId] : []);
+
+    if (targetListIds.length === 0) {
       res.status(400).json({ error: 'Campaign has no audience list assigned. Please edit the campaign to assign a list before launching.' });
       return;
     }
@@ -350,34 +375,42 @@ export const activateCampaign = async (req: Request, res: Response): Promise<voi
       sequenceId = newSeq.id;
     }
 
-    // 1. Fetch eligible contacts from the List, strictly scoped to current user
+    // 1. Fetch eligible contacts from all selected Lists, strictly scoped to current user
     let eligibleContactIds: string[] = [];
-    
-    if (fullCampaign.list?.listType === 'dynamic' && fullCampaign.list?.rules) {
-      const rules = fullCampaign.list.rules as any;
-      let whereClause: any = { userId: user.userId };
-      if (rules.city) whereClause.city = { contains: rules.city, mode: 'insensitive' };
-      if (rules.jobTitle) whereClause.jobTitle = { contains: rules.jobTitle, mode: 'insensitive' };
-      if (rules.industry) {
-        whereClause.organization = { industry: { contains: rules.industry, mode: 'insensitive' } };
+    const contactIdSet = new Set<string>();
+
+    const assignedLists = await prisma.list.findMany({
+      where: { id: { in: targetListIds } }
+    });
+
+    for (const list of assignedLists) {
+      if (list.listType === 'dynamic' && list.rules) {
+        const rules = list.rules as any;
+        let whereClause: any = { userId: user.userId };
+        if (rules.city) whereClause.city = { contains: rules.city, mode: 'insensitive' };
+        if (rules.jobTitle) whereClause.jobTitle = { contains: rules.jobTitle, mode: 'insensitive' };
+        if (rules.industry) {
+          whereClause.organization = { industry: { contains: rules.industry, mode: 'insensitive' } };
+        }
+        
+        const contacts = await prisma.contact.findMany({
+          where: whereClause,
+          select: { id: true }
+        });
+        contacts.forEach(c => contactIdSet.add(c.id));
+      } else {
+        const members = await prisma.listMember.findMany({
+          where: { 
+            listId: list.id,
+            contact: { userId: user.userId }
+          },
+          select: { contactId: true }
+        });
+        members.forEach(m => contactIdSet.add(m.contactId));
       }
-      
-      const contacts = await prisma.contact.findMany({
-        where: whereClause,
-        select: { id: true }
-      });
-      eligibleContactIds = contacts.map(c => c.id);
-      
-    } else {
-      const members = await prisma.listMember.findMany({
-        where: { 
-          listId: fullCampaign.listId,
-          contact: { userId: user.userId }
-        },
-        select: { contactId: true }
-      });
-      eligibleContactIds = members.map(m => m.contactId);
     }
+
+    eligibleContactIds = Array.from(contactIdSet);
     
     // 2. Filter out already enrolled contacts
     const existingEnrollments = await prisma.enrollment.findMany({
@@ -521,6 +554,7 @@ export const duplicateCampaign = async (req: Request, res: Response): Promise<vo
         campaignType: original.campaignType,
         audienceType: original.audienceType,
         listId: original.listId,
+        listIds: ((original as any).listIds && (original as any).listIds.length > 0) ? (original as any).listIds : (original.listId ? [original.listId] : []),
         status: 'draft',
         approvalStatus: 'DRAFT',
         senderMailboxes: original.senderMailboxes,
@@ -602,7 +636,7 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
     const campaignId = String(id);
     const {
       name, description, campaignCode, campaignType,
-      listId,
+      listId, listIds,
       senderMailboxes, replyToEmail,
       timezone, sendingDays, sendingWindowStart, sendingWindowEnd,
       dailySendLimit, hourlySendLimit, delayBetweenSendsSeconds,
@@ -613,9 +647,20 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
     const existing = await OwnershipGuard.assertCampaign(req, res, campaignId);
     if (!existing) return;
 
-    if (listId) {
-      const list = await OwnershipGuard.assertList(req, res, listId);
-      if (!list) return;
+    let targetListIds: string[] | undefined = undefined;
+    if (listIds !== undefined || listId !== undefined) {
+      if (Array.isArray(listIds)) {
+        targetListIds = listIds.map(id => String(id).trim()).filter(Boolean);
+      } else if (listId) {
+        targetListIds = [String(listId).trim()];
+      } else {
+        targetListIds = [];
+      }
+
+      for (const lid of targetListIds) {
+        const list = await OwnershipGuard.assertList(req, res, lid);
+        if (!list) return;
+      }
     }
 
     const fullExisting = await prisma.campaign.findUnique({
@@ -639,7 +684,10 @@ export const updateCampaign = async (req: Request, res: Response): Promise<void>
       if (description !== undefined) campaignUpdateData.description = description;
       if (campaignCode !== undefined) campaignUpdateData.campaignCode = campaignCode;
       if (campaignType !== undefined) campaignUpdateData.campaignType = campaignType;
-      if (listId !== undefined) campaignUpdateData.listId = listId || null;
+      if (targetListIds !== undefined) {
+        campaignUpdateData.listIds = targetListIds;
+        campaignUpdateData.listId = targetListIds[0] || null;
+      }
       if (senderMailboxes !== undefined) campaignUpdateData.senderMailboxes = senderMailboxes;
       if (replyToEmail !== undefined) campaignUpdateData.replyToEmail = replyToEmail;
       if (timezone !== undefined) campaignUpdateData.timezone = timezone;
@@ -875,7 +923,7 @@ export const getEligibilityPreview = async (req: Request, res: Response): Promis
     const user = OwnershipGuard.requireUser(req, res);
     if (!user) return;
 
-    const { listId, rules } = req.query;
+    const { listId, listIds, rules } = req.query;
     
     let eligibleContactIds: string[] = [];
     
@@ -898,18 +946,29 @@ export const getEligibilityPreview = async (req: Request, res: Response): Promis
       });
       
       eligibleContactIds = contacts.map(c => c.id);
-    } else if (listId) {
-      const list = await OwnershipGuard.assertList(req, res, String(listId));
-      if (!list) return;
+    } else {
+      let targetListIds: string[] = [];
+      if (listIds) {
+        targetListIds = String(listIds).split(',').map(s => s.trim()).filter(Boolean);
+      } else if (listId) {
+        targetListIds = [String(listId).trim()];
+      }
 
-      const members = await prisma.listMember.findMany({
-        where: { 
-          listId: list.id,
-          contact: { userId: user.userId }
-        },
-        select: { contactId: true }
-      });
-      eligibleContactIds = members.map(m => m.contactId);
+      if (targetListIds.length > 0) {
+        for (const lid of targetListIds) {
+          const list = await OwnershipGuard.assertList(req, res, lid);
+          if (!list) return;
+        }
+
+        const members = await prisma.listMember.findMany({
+          where: { 
+            listId: { in: targetListIds },
+            contact: { userId: user.userId }
+          },
+          select: { contactId: true }
+        });
+        eligibleContactIds = Array.from(new Set(members.map(m => m.contactId)));
+      }
     }
     
     const totalContacts = eligibleContactIds.length;

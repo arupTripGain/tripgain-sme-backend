@@ -63,6 +63,18 @@ export const getBulkCampaigns = async (req: Request, res: Response): Promise<voi
       orderBy: { createdAt: 'desc' }
     });
 
+    const allListIds = Array.from(new Set(campaigns.flatMap(c => {
+      const ids: string[] = [];
+      if ((c as any).listIds && (c as any).listIds.length > 0) ids.push(...(c as any).listIds);
+      if (c.listId) ids.push(c.listId);
+      return ids;
+    })));
+    const allLists = allListIds.length > 0 ? await prisma.list.findMany({
+      where: { id: { in: allListIds } },
+      select: { id: true, name: true }
+    }) : [];
+    const listMap = new Map(allLists.map(l => [l.id, l.name]));
+
     const enriched = campaigns.map((camp) => {
       const enrollments = camp.enrollments || [];
       const messages = camp.messages || [];
@@ -75,6 +87,12 @@ export const getBulkCampaigns = async (req: Request, res: Response): Promise<voi
       const bounces = enrollments.filter((e) => ['bounced', 'soft_bounced'].includes(e.status)).length;
       const unsubscribes = enrollments.filter((e) => e.status === 'unsubscribed').length;
 
+      const cListIds = ((camp as any).listIds && (camp as any).listIds.length > 0)
+        ? (camp as any).listIds
+        : (camp.listId ? [camp.listId] : []);
+      const campLists = cListIds.map((id: string) => ({ id, name: listMap.get(id) || camp.list?.name || 'Unknown List' }));
+      const listName = campLists.map((l: any) => l.name).join(', ') || camp.list?.name || null;
+
       return {
         id: camp.id,
         name: camp.name,
@@ -82,7 +100,9 @@ export const getBulkCampaigns = async (req: Request, res: Response): Promise<voi
         status: camp.status,
         campaignType: camp.campaignType,
         listId: camp.listId,
-        listName: camp.list?.name || null,
+        listIds: cListIds,
+        listName,
+        lists: campLists,
         senderMailboxes: camp.senderMailboxes,
         dailySendLimit: camp.dailySendLimit,
         hourlySendLimit: camp.hourlySendLimit,
@@ -144,7 +164,19 @@ export const getBulkCampaignById = async (req: Request, res: Response): Promise<
       return;
     }
 
-    res.status(200).json(campaign);
+    const targetListIds = ((campaign as any).listIds && (campaign as any).listIds.length > 0)
+      ? (campaign as any).listIds
+      : (campaign.listId ? [campaign.listId] : []);
+    const lists = targetListIds.length > 0 ? await prisma.list.findMany({
+      where: { id: { in: targetListIds } },
+      select: { id: true, name: true }
+    }) : (campaign.list ? [campaign.list] : []);
+
+    res.status(200).json({
+      ...campaign,
+      listIds: targetListIds,
+      lists
+    });
   } catch (error: any) {
     console.error('Error in getBulkCampaignById:', error);
     res.status(500).json({ error: 'Failed to fetch bulk campaign' });
@@ -163,6 +195,7 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
       name,
       description,
       listId,
+      listIds,
       senderMailboxes,
       subject,
       bodyHtml,
@@ -181,13 +214,20 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
 
     const workspace = await getWorkspace(user.userId);
 
-    // Verify list ownership if provided
-    if (listId) {
-      const list = await prisma.list.findFirst({
-        where: { id: listId, userId: user.userId }
+    // Normalize and verify list ownership if provided
+    let targetListIds: string[] = [];
+    if (Array.isArray(listIds)) {
+      targetListIds = listIds.map(id => String(id).trim()).filter(Boolean);
+    } else if (listId) {
+      targetListIds = [String(listId).trim()];
+    }
+
+    if (targetListIds.length > 0) {
+      const verifiedLists = await prisma.list.findMany({
+        where: { id: { in: targetListIds }, userId: user.userId }
       });
-      if (!list) {
-        res.status(400).json({ error: 'Selected audience list not found or unauthorized' });
+      if (verifiedLists.length !== targetListIds.length) {
+        res.status(400).json({ error: 'One or more selected audience lists not found or unauthorized' });
         return;
       }
     }
@@ -223,7 +263,8 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
         campaignType: 'BULK_EMAIL',
         audienceType: 'list',
         status: 'draft',
-        listId: listId || null,
+        listId: targetListIds[0] || null,
+        listIds: targetListIds,
         senderMailboxes: Array.isArray(senderMailboxes) ? senderMailboxes : [],
         dailySendLimit: Number(dailySendLimit) || 100,
         hourlySendLimit: Number(hourlySendLimit) || 20,
@@ -293,6 +334,7 @@ export const updateBulkCampaign = async (req: Request, res: Response): Promise<v
       name,
       description,
       listId,
+      listIds,
       senderMailboxes,
       subject,
       bodyHtml,
@@ -307,7 +349,25 @@ export const updateBulkCampaign = async (req: Request, res: Response): Promise<v
     const updateData: any = {};
     if (name !== undefined) updateData.name = name.trim();
     if (description !== undefined) updateData.description = description;
-    if (listId !== undefined) updateData.listId = listId;
+    if (listIds !== undefined || listId !== undefined) {
+      let targetListIds: string[] = [];
+      if (Array.isArray(listIds)) {
+        targetListIds = listIds.map(id => String(id).trim()).filter(Boolean);
+      } else if (listId) {
+        targetListIds = [String(listId).trim()];
+      }
+      if (targetListIds.length > 0) {
+        const verifiedLists = await prisma.list.findMany({
+          where: { id: { in: targetListIds }, userId: user.userId }
+        });
+        if (verifiedLists.length !== targetListIds.length) {
+          res.status(400).json({ error: 'One or more selected audience lists not found or unauthorized' });
+          return;
+        }
+      }
+      updateData.listIds = targetListIds;
+      updateData.listId = targetListIds[0] || null;
+    }
     if (Array.isArray(senderMailboxes)) updateData.senderMailboxes = senderMailboxes;
     if (dailySendLimit !== undefined) updateData.dailySendLimit = Number(dailySendLimit);
     if (hourlySendLimit !== undefined) updateData.hourlySendLimit = Number(hourlySendLimit);
@@ -372,15 +432,25 @@ export const getBulkCampaignPreflight = async (req: Request, res: Response): Pro
       return;
     }
 
-    const listId = req.query.listId as string || campaign.listId;
-    if (!listId) {
+    let targetListIds: string[] = [];
+    if (req.query.listIds) {
+      targetListIds = String(req.query.listIds).split(',').map(s => s.trim()).filter(Boolean);
+    } else if (req.query.listId) {
+      targetListIds = [String(req.query.listId).trim()];
+    } else if ((campaign as any).listIds && (campaign as any).listIds.length > 0) {
+      targetListIds = (campaign as any).listIds;
+    } else if (campaign.listId) {
+      targetListIds = [campaign.listId];
+    }
+
+    if (targetListIds.length === 0) {
       res.status(400).json({ error: 'No audience list selected for this campaign' });
       return;
     }
 
-    // 1. Fetch raw list members
+    // 1. Fetch raw list members across all selected lists
     const members = await prisma.listMember.findMany({
-      where: { listId },
+      where: { listId: { in: targetListIds } },
       include: {
         contact: {
           include: {
@@ -400,6 +470,7 @@ export const getBulkCampaignPreflight = async (req: Request, res: Response): Pro
     let softBouncedCount = 0;
 
     const seenEmails = new Set<string>();
+    const seenContactIds = new Set<string>();
     const eligibleContactIds: string[] = [];
 
     // Fetch user/global suppression list
@@ -456,11 +527,12 @@ export const getBulkCampaignPreflight = async (req: Request, res: Response): Pro
         continue;
       }
 
-      // Check duplicate within list
-      if (seenEmails.has(normEmail)) {
+      // Check duplicate within list or across multiple lists
+      if (seenContactIds.has(contact.id) || seenEmails.has(normEmail)) {
         duplicateCount++;
         continue;
       }
+      seenContactIds.add(contact.id);
       seenEmails.add(normEmail);
 
       // Check suppression list
@@ -928,13 +1000,20 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
 
     let targetContactIds: string[] = Array.isArray(contactIds) ? contactIds : [];
     if (targetContactIds.length === 0) {
-      if (!campaign.listId) {
+      let targetListIds: string[] = [];
+      if ((campaign as any).listIds && (campaign as any).listIds.length > 0) {
+        targetListIds = (campaign as any).listIds;
+      } else if (campaign.listId) {
+        targetListIds = [campaign.listId];
+      }
+
+      if (targetListIds.length === 0) {
         res.status(400).json({ error: 'No audience list or contact IDs provided to queue' });
         return;
       }
 
-      const list = await prisma.list.findUnique({
-        where: { id: campaign.listId },
+      const lists = await prisma.list.findMany({
+        where: { id: { in: targetListIds }, userId: user.userId },
         include: {
           members: {
             include: {
@@ -946,14 +1025,16 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
         }
       });
 
-      if (!list) {
-        res.status(400).json({ error: 'Audience list not found' });
+      if (lists.length === 0) {
+        res.status(400).json({ error: 'Audience lists not found' });
         return;
       }
 
-      const allEmails = list.members
-        .flatMap((m) => m.contact.emails)
-        .map((e) => e.normalizedEmail.toLowerCase());
+      const allMembers = lists.flatMap(l => l.members);
+      const allEmails = allMembers
+        .flatMap((m) => m.contact?.emails || [])
+        .map((e) => (e.normalizedEmail || e.email || '').toLowerCase())
+        .filter(Boolean);
 
       const suppressions = await prisma.suppressionList.findMany({
         where: { normalizedEmail: { in: allEmails } }
@@ -962,9 +1043,11 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
 
       const eligibleIds: string[] = [];
       const seenEmails = new Set<string>();
+      const seenContactIds = new Set<string>();
 
-      for (const member of list.members) {
+      for (const member of allMembers) {
         const contact = member.contact;
+        if (!contact || seenContactIds.has(contact.id)) continue;
         if (contact.doNotContact || contact.unsubscribeAt) continue;
 
         const primaryEmailObj = contact.emails.find((e) => e.isPrimary) || contact.emails[0];
@@ -974,6 +1057,7 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
         if (primaryEmailObj.isValid === false || primaryEmailObj.verificationStatus === 'invalid' || primaryEmailObj.verificationStatus === 'bounced' || primaryEmailObj.verificationStatus === 'soft_bounced') continue;
         if (seenEmails.has(normEmail) || suppressionSet.has(normEmail)) continue;
 
+        seenContactIds.add(contact.id);
         seenEmails.add(normEmail);
         eligibleIds.push(contact.id);
       }
