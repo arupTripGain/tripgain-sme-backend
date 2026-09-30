@@ -7,6 +7,7 @@ import { OwnershipGuard } from '../utils/ownershipGuard';
 import { decrypt } from './mailboxController';
 import { selectFairMailbox, getCampaignEnrollmentCountsByMailbox } from '../services/rotationService';
 import { buildCanonicalLeadContext } from '../utils/templateContext';
+import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
 
 const prisma = new PrismaClient();
 
@@ -26,6 +27,15 @@ const getWorkspace = async (userId?: string) => {
     });
   }
   return workspace;
+};
+
+const formatSequenceSteps = (rawSteps: any[]) => {
+  return rawSteps.map(s => ({
+    ...s,
+    subject: s.subjectTemplate || '',
+    body: s.bodyHtmlTemplate || s.bodyTemplate || '',
+    bodyHtml: s.bodyHtmlTemplate || s.bodyTemplate || ''
+  }));
 };
 
 // ---------------------------------------------------------------------
@@ -118,7 +128,9 @@ export const getBulkCampaigns = async (req: Request, res: Response): Promise<voi
         unsubscribes,
         createdAt: camp.createdAt,
         updatedAt: camp.updatedAt,
-        step: camp.sequences?.[0]?.steps?.[0] || null
+        step: camp.sequences?.[0]?.steps?.[0] ? formatSequenceSteps([camp.sequences[0].steps[0]])[0] : null,
+        steps: formatSequenceSteps(camp.sequences?.[0]?.steps || []),
+        stepsCount: camp.sequences?.[0]?.steps?.length || (camp.sequences?.[0]?.steps?.[0] ? 1 : 0)
       };
     });
 
@@ -154,7 +166,10 @@ export const getBulkCampaignById = async (req: Request, res: Response): Promise<
           }
         },
         enrollments: {
-          select: { id: true, status: true, mailboxId: true }
+          select: { id: true, status: true, currentStep: true, mailboxId: true }
+        },
+        messages: {
+          select: { id: true, status: true, sentAt: true, createdAt: true, sequenceStepId: true, enrollmentId: true, toEmail: true }
         }
       }
     });
@@ -163,6 +178,9 @@ export const getBulkCampaignById = async (req: Request, res: Response): Promise<
       res.status(404).json({ error: 'Bulk campaign not found' });
       return;
     }
+
+    const steps = formatSequenceSteps(campaign.sequences?.[0]?.steps || []);
+    const { stepProgress, campaignCompletion } = calculateCampaignStepProgressAndCompletion(campaign);
 
     const targetListIds = ((campaign as any).listIds && (campaign as any).listIds.length > 0)
       ? (campaign as any).listIds
@@ -175,7 +193,12 @@ export const getBulkCampaignById = async (req: Request, res: Response): Promise<
     res.status(200).json({
       ...campaign,
       listIds: targetListIds,
-      lists
+      lists,
+      steps,
+      sequenceSteps: steps,
+      stepsCount: steps.length,
+      stepProgress,
+      campaignCompletion
     });
   } catch (error: any) {
     console.error('Error in getBulkCampaignById:', error);
@@ -232,18 +255,22 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
       }
     }
 
+    const targetMailboxes = Array.isArray(senderMailboxes)
+      ? senderMailboxes
+      : (Array.isArray(req.body.mailboxIds) ? req.body.mailboxIds : []);
+
     // Verify mailbox ownership if provided
-    if (Array.isArray(senderMailboxes) && senderMailboxes.length > 0) {
+    if (targetMailboxes.length > 0) {
       const mailboxes = await prisma.mailbox.findMany({
         where: {
           OR: [
-            { id: { in: senderMailboxes } },
-            { email: { in: senderMailboxes } }
+            { id: { in: targetMailboxes } },
+            { email: { in: targetMailboxes } }
           ],
           userId: user.userId
         }
       });
-      if (mailboxes.length !== senderMailboxes.length) {
+      if (mailboxes.length !== targetMailboxes.length) {
         res.status(400).json({ error: 'One or more selected mailboxes are invalid or unauthorized' });
         return;
       }
@@ -253,6 +280,45 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
     const bHtml = req.body.bodyHtmlTemplate !== undefined 
       ? req.body.bodyHtmlTemplate 
       : (req.body.bodyHtml !== undefined ? req.body.bodyHtml : (req.body.bodyTemplate || ''));
+
+    const rawSteps = Array.isArray(req.body.sequenceSteps)
+      ? req.body.sequenceSteps
+      : (Array.isArray(req.body.steps) ? req.body.steps : []);
+
+    let stepsCreateData: any[];
+    if (rawSteps.length > 0) {
+      stepsCreateData = rawSteps.map((s: any, idx: number) => {
+        const stepSub = s.subjectTemplate !== undefined ? s.subjectTemplate : (s.subject || '');
+        const stepBody = s.bodyHtmlTemplate !== undefined
+          ? s.bodyHtmlTemplate
+          : (s.bodyHtml !== undefined ? s.bodyHtml : (s.bodyTemplate || s.body || ''));
+        return {
+          stepNumber: s.stepNumber ? Number(s.stepNumber) : idx + 1,
+          stepType: s.stepType || s.type || 'email',
+          stepName: s.stepName || (idx === 0 ? 'Initial Send' : `Follow-up ${idx}`),
+          delayDays: idx === 0 ? 0 : Math.max(0, Number(s.delayDays || 1)),
+          subjectTemplate: stepSub || '',
+          bodyTemplate: stepBody || '',
+          bodyHtmlTemplate: stepBody || '',
+          includeTracking: s.includeTracking !== undefined ? Boolean(s.includeTracking) : true,
+          includeUnsubscribe: s.includeUnsubscribe !== undefined ? Boolean(s.includeUnsubscribe) : true,
+          active: s.active !== undefined ? Boolean(s.active) : true
+        };
+      });
+    } else {
+      stepsCreateData = [{
+        stepNumber: 1,
+        stepType: 'email',
+        stepName: 'Bulk Email',
+        delayDays: 0,
+        subjectTemplate: sub || '',
+        bodyTemplate: bHtml || '',
+        bodyHtmlTemplate: bHtml || '',
+        includeTracking: true,
+        includeUnsubscribe: true,
+        active: true
+      }];
+    }
 
     const campaign = await prisma.campaign.create({
       data: {
@@ -265,7 +331,7 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
         status: 'draft',
         listId: targetListIds[0] || null,
         listIds: targetListIds,
-        senderMailboxes: Array.isArray(senderMailboxes) ? senderMailboxes : [],
+        senderMailboxes: targetMailboxes,
         dailySendLimit: Number(dailySendLimit) || 100,
         hourlySendLimit: Number(hourlySendLimit) || 20,
         timezone: timezone || 'Asia/Kolkata',
@@ -278,28 +344,24 @@ export const createBulkCampaign = async (req: Request, res: Response): Promise<v
             sequenceType: 'BULK_EMAIL',
             status: 'active',
             steps: {
-              create: {
-                stepNumber: 1,
-                stepType: 'email',
-                stepName: 'Bulk Email',
-                subjectTemplate: sub || '',
-                bodyTemplate: bHtml || '',
-                bodyHtmlTemplate: bHtml || '',
-                includeTracking: true,
-                includeUnsubscribe: true
-              }
+              create: stepsCreateData
             }
           }
         }
       },
       include: {
         sequences: {
-          include: { steps: true }
+          include: { steps: { orderBy: { stepNumber: 'asc' } } }
         }
       }
     });
 
-    res.status(201).json(campaign);
+    const createdSteps = formatSequenceSteps(campaign.sequences?.[0]?.steps || []);
+    res.status(201).json({
+      ...campaign,
+      steps: createdSteps,
+      stepsCount: createdSteps.length
+    });
   } catch (error: any) {
     console.error('Error in createBulkCampaign:', error);
     res.status(500).json({ error: 'Failed to create bulk campaign' });
@@ -317,7 +379,7 @@ export const updateBulkCampaign = async (req: Request, res: Response): Promise<v
     const campaignId = req.params.id as string;
     const campaign = await prisma.campaign.findFirst({
       where: { id: campaignId, userId: user.userId, campaignType: 'BULK_EMAIL' },
-      include: { sequences: { include: { steps: true } } }
+      include: { sequences: { include: { steps: { orderBy: { stepNumber: 'asc' } } } } }
     });
 
     if (!campaign) {
@@ -368,7 +430,10 @@ export const updateBulkCampaign = async (req: Request, res: Response): Promise<v
       updateData.listIds = targetListIds;
       updateData.listId = targetListIds[0] || null;
     }
-    if (Array.isArray(senderMailboxes)) updateData.senderMailboxes = senderMailboxes;
+    const targetMailboxesUpdate = Array.isArray(senderMailboxes) 
+      ? senderMailboxes 
+      : (Array.isArray(req.body.mailboxIds) ? req.body.mailboxIds : undefined);
+    if (targetMailboxesUpdate !== undefined) updateData.senderMailboxes = targetMailboxesUpdate;
     if (dailySendLimit !== undefined) updateData.dailySendLimit = Number(dailySendLimit);
     if (hourlySendLimit !== undefined) updateData.hourlySendLimit = Number(hourlySendLimit);
     if (timezone !== undefined) updateData.timezone = timezone;
@@ -382,27 +447,89 @@ export const updateBulkCampaign = async (req: Request, res: Response): Promise<v
       data: updateData
     });
 
-    // Update SequenceStep 1
-    const step1 = campaign.sequences?.[0]?.steps?.[0];
-    const subUpdate = req.body.subjectTemplate !== undefined ? req.body.subjectTemplate : req.body.subject;
-    const bHtmlUpdate = req.body.bodyHtmlTemplate !== undefined 
-      ? req.body.bodyHtmlTemplate 
-      : (req.body.bodyHtml !== undefined ? req.body.bodyHtml : req.body.bodyTemplate);
+    // Update sequence steps if provided
+    const rawSteps = Array.isArray(req.body.sequenceSteps)
+      ? req.body.sequenceSteps
+      : (Array.isArray(req.body.steps) ? req.body.steps : null);
 
-    if (step1 && (subUpdate !== undefined || bHtmlUpdate !== undefined)) {
-      const stepUpdateData: any = {};
-      if (subUpdate !== undefined) stepUpdateData.subjectTemplate = subUpdate;
-      if (bHtmlUpdate !== undefined) {
-        stepUpdateData.bodyTemplate = bHtmlUpdate;
-        stepUpdateData.bodyHtmlTemplate = bHtmlUpdate;
+    if (rawSteps && rawSteps.length > 0) {
+      let sequenceId = campaign.sequences?.[0]?.id;
+      if (!sequenceId) {
+        const newSeq = await prisma.sequence.create({
+          data: {
+            campaignId: campaign.id,
+            name: `${campaign.name} Sequence`,
+            sequenceType: 'BULK_EMAIL',
+            status: 'active'
+          }
+        });
+        sequenceId = newSeq.id;
       }
-      await prisma.sequenceStep.update({
-        where: { id: step1.id },
-        data: stepUpdateData
+
+      const seqId = sequenceId;
+      await prisma.$transaction(async (tx) => {
+        await tx.sequenceStep.deleteMany({
+          where: { sequenceId: seqId }
+        });
+
+        await tx.sequenceStep.createMany({
+          data: rawSteps.map((s: any, idx: number) => {
+            const stepSub = s.subjectTemplate !== undefined ? s.subjectTemplate : (s.subject || '');
+            const stepBody = s.bodyHtmlTemplate !== undefined
+              ? s.bodyHtmlTemplate
+              : (s.bodyHtml !== undefined ? s.bodyHtml : (s.bodyTemplate || s.body || ''));
+            return {
+              sequenceId: seqId,
+              stepNumber: s.stepNumber ? Number(s.stepNumber) : idx + 1,
+              stepType: s.stepType || s.type || 'email',
+              stepName: s.stepName || (idx === 0 ? 'Initial Send' : `Follow-up ${idx}`),
+              delayDays: idx === 0 ? 0 : Math.max(0, Number(s.delayDays || 1)),
+              subjectTemplate: stepSub || '',
+              bodyTemplate: stepBody || '',
+              bodyHtmlTemplate: stepBody || '',
+              includeTracking: s.includeTracking !== undefined ? Boolean(s.includeTracking) : true,
+              includeUnsubscribe: s.includeUnsubscribe !== undefined ? Boolean(s.includeUnsubscribe) : true,
+              active: s.active !== undefined ? Boolean(s.active) : true
+            };
+          })
+        });
       });
+    } else {
+      // Legacy single step 1 update fallback
+      const step1 = campaign.sequences?.[0]?.steps?.[0];
+      const subUpdate = req.body.subjectTemplate !== undefined ? req.body.subjectTemplate : req.body.subject;
+      const bHtmlUpdate = req.body.bodyHtmlTemplate !== undefined 
+        ? req.body.bodyHtmlTemplate 
+        : (req.body.bodyHtml !== undefined ? req.body.bodyHtml : req.body.bodyTemplate);
+
+      if (step1 && (subUpdate !== undefined || bHtmlUpdate !== undefined)) {
+        const stepUpdateData: any = {};
+        if (subUpdate !== undefined) stepUpdateData.subjectTemplate = subUpdate;
+        if (bHtmlUpdate !== undefined) {
+          stepUpdateData.bodyTemplate = bHtmlUpdate;
+          stepUpdateData.bodyHtmlTemplate = bHtmlUpdate;
+        }
+        await prisma.sequenceStep.update({
+          where: { id: step1.id },
+          data: stepUpdateData
+        });
+      }
     }
 
-    res.status(200).json(updated);
+    const refreshed = await prisma.campaign.findUnique({
+      where: { id: campaign.id },
+      include: {
+        sequences: {
+          include: { steps: { orderBy: { stepNumber: 'asc' } } }
+        }
+      }
+    });
+    const updatedSteps = formatSequenceSteps(refreshed?.sequences?.[0]?.steps || []);
+    res.status(200).json({
+      ...(refreshed || updated),
+      steps: updatedSteps,
+      stepsCount: updatedSteps.length
+    });
   } catch (error: any) {
     console.error('Error in updateBulkCampaign:', error);
     res.status(500).json({ error: 'Failed to update bulk campaign' });
@@ -601,39 +728,50 @@ export const getBulkCampaignPreflight = async (req: Request, res: Response): Pro
       ? (finalEligibleCount / effectiveHourlyRate).toFixed(1)
       : 'N/A';
 
-    // 3. Template Validation
-    const step1 = campaign.sequences?.[0]?.steps?.[0];
-    const subject = step1?.subjectTemplate || '';
-    const body = step1?.bodyHtmlTemplate || step1?.bodyTemplate || '';
+    // 3. Template Validation across all sequence steps
+    const steps = campaign.sequences?.[0]?.steps || [];
+    const step1 = steps[0];
+    const subject = (step1?.subjectTemplate || '').trim();
+    const body = (step1?.bodyHtmlTemplate || step1?.bodyTemplate || '').trim();
+    const hasUnsubscribe = steps.length > 0 && steps.every(s => (s.bodyHtmlTemplate || s.bodyTemplate || '').includes('{{unsubscribeLink}}') || (s.bodyHtmlTemplate || s.bodyTemplate || '').toLowerCase().includes('unsubscribe'));
 
     const warnings: string[] = [];
     const errors: string[] = [];
 
-    if (!subject.trim()) {
-      errors.push('Subject template is empty.');
-    }
-
-    if (!body.trim()) {
-      errors.push('Email body template is empty.');
-    }
-
-    const hasUnsubscribe = body.includes('{{unsubscribeLink}}') || body.toLowerCase().includes('unsubscribe');
-    if (!hasUnsubscribe) {
-      warnings.push('Template is missing {{unsubscribeLink}}. For deliverability and compliance, adding an unsubscribe link is strongly recommended.');
-    }
-
-    // Check for unresolved variables
-    const varMatches = (subject + ' ' + body).match(/\{\{([a-zA-Z0-9_]+)\}\}/g) || [];
     const allowedVars = new Set([
       '{{firstName}}', '{{lastName}}', '{{email}}', '{{companyName}}',
       '{{title}}', '{{city}}', '{{personalization}}', '{{personalizedLine}}',
       '{{senderName}}', '{{senderCompany}}', '{{unsubscribeLink}}'
     ]);
 
-    for (const vm of varMatches) {
-      if (!allowedVars.has(vm)) {
-        warnings.push(`Unrecognized template variable: ${vm}`);
-      }
+    if (steps.length === 0) {
+      errors.push('No email sequence steps found in campaign.');
+    } else {
+      steps.forEach((step, idx) => {
+        const stepNum = step.stepNumber || idx + 1;
+        const stepSub = (step.subjectTemplate || '').trim();
+        const stepBody = (step.bodyHtmlTemplate || step.bodyTemplate || '').trim();
+
+        if (stepNum === 1 && !stepSub) {
+          errors.push(`Step ${stepNum}: Subject line is required.`);
+        }
+
+        if (!stepBody) {
+          errors.push(`Step ${stepNum}: Email body content is empty.`);
+        }
+
+        const hasStepUnsub = stepBody.includes('{{unsubscribeLink}}') || stepBody.toLowerCase().includes('unsubscribe');
+        if (!hasStepUnsub) {
+          warnings.push(`Step ${stepNum}: Missing {{unsubscribeLink}}. For deliverability and compliance, adding an unsubscribe link is strongly recommended.`);
+        }
+
+        const varMatches = (stepSub + ' ' + stepBody).match(/\{\{([a-zA-Z0-9_]+)\}\}/g) || [];
+        for (const vm of varMatches) {
+          if (!allowedVars.has(vm)) {
+            warnings.push(`Step ${stepNum}: Unrecognized template variable: ${vm}`);
+          }
+        }
+      });
     }
 
     if (mailboxes.length === 0) {
@@ -838,9 +976,14 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
     const sampleToken = 'test-preview-token';
     const unsubscribeLink = trackingBaseUrl ? `${trackingBaseUrl}/u/${sampleToken}` : '#';
 
-    const step1 = campaign.sequences?.[0]?.steps?.[0];
-    const rawSubject = step1?.subjectTemplate || 'Test Email Preview';
-    const rawBody = step1?.bodyHtmlTemplate || step1?.bodyTemplate || '<p>This is a test bulk email preview.</p>';
+    const steps = campaign.sequences?.[0]?.steps || [];
+    const stepNumberInput = req.body.stepNumber !== undefined ? Number(req.body.stepNumber) : undefined;
+    const targetStep = stepNumberInput
+      ? (steps.find(s => s.stepNumber === stepNumberInput) || steps[0])
+      : (req.body.stepId ? (steps.find(s => s.id === req.body.stepId) || steps[0]) : steps[0]);
+
+    const rawSubject = targetStep?.subjectTemplate || 'Test Email Preview';
+    const rawBody = targetStep?.bodyHtmlTemplate || targetStep?.bodyTemplate || '<p>This is a test bulk email preview.</p>';
     const senderName = mailbox.displayName || user.name || 'TripGain Team';
     const senderCompany = (mailbox as any).workspace?.name || 'TripGain';
 
@@ -904,12 +1047,25 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             messageId: fakeMsgId,
             renderedSubject
           });
-        } else {
+          const styledTestHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body, div, p { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; }
+      p { margin: 0 0 14px 0; }
+    </style>
+  </head>
+  <body>
+    ${renderedBody}
+  </body>
+</html>`;
+
           const info = await transporter.sendMail({
             from: `"${senderName}" <${mailbox.email}>`,
             to: target.recipientEmail,
             subject: renderedSubject,
-            html: renderedBody,
+            html: styledTestHtml,
             headers: {
               'X-TripGain-Test': 'true',
               ...(unsubscribeLink && unsubscribeLink !== '#' ? {
@@ -947,6 +1103,8 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
 
     res.status(200).json({
       success: true,
+      stepNumber: targetStep?.stepNumber || 1,
+      stepId: targetStep?.id,
       count: targets.length,
       recipients: targets.map(t => t.recipientEmail),
       totalSent: successfulCount,
@@ -973,7 +1131,7 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
     if (!user) return;
 
     const campaignId = req.params.id as string;
-    const { contactIds } = req.body;
+    const { contactIds } = req.body || {};
 
     const campaign = await prisma.campaign.findFirst({
       where: { id: campaignId, userId: user.userId, campaignType: 'BULK_EMAIL' },
@@ -987,7 +1145,7 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    if (campaign.status !== 'draft' && campaign.status !== 'paused') {
+    if (campaign.status === 'completed' || campaign.status === 'cancelled') {
       res.status(400).json({ error: `Cannot queue recipients for a campaign in "${campaign.status}" state` });
       return;
     }
@@ -1103,10 +1261,12 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
       enrolledIds.push(enrollment.id);
     }
 
-    await prisma.campaign.update({
-      where: { id: campaign.id },
-      data: { status: 'queued' }
-    });
+    if (campaign.status === 'draft') {
+      await prisma.campaign.update({
+        where: { id: campaign.id },
+        data: { status: 'queued' }
+      });
+    }
 
     res.status(200).json({
       success: true,
@@ -1115,7 +1275,7 @@ export const queueBulkCampaign = async (req: Request, res: Response): Promise<vo
     });
   } catch (error: any) {
     console.error('Error in queueBulkCampaign:', error);
-    res.status(500).json({ error: 'Failed to queue recipients' });
+    res.status(500).json({ error: error?.message || 'Failed to queue recipients' });
   }
 };
 
@@ -1130,7 +1290,10 @@ export const launchBulkCampaign = async (req: Request, res: Response): Promise<v
     const campaignId = req.params.id as string;
     const campaign = await prisma.campaign.findFirst({
       where: { id: campaignId, userId: user.userId, campaignType: 'BULK_EMAIL' },
-      include: { enrollments: { where: { status: 'pending' } } }
+      include: {
+        enrollments: { where: { status: 'pending' } },
+        sequences: { include: { steps: true } }
+      }
     });
 
     if (!campaign) {
@@ -1138,9 +1301,110 @@ export const launchBulkCampaign = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    if (campaign.enrollments.length === 0) {
-      res.status(400).json({ error: 'No pending recipients in queue. Please queue validated recipients before launch.' });
+    if (campaign.status === 'completed' || campaign.status === 'cancelled') {
+      res.status(400).json({ error: `Cannot launch a ${campaign.status} campaign` });
       return;
+    }
+
+    let pendingCount = campaign.enrollments.length;
+
+    // Seamless auto-enrollment: if 0 pending enrollments, auto-enroll audience lists
+    if (pendingCount === 0) {
+      const sequenceId = campaign.sequences?.[0]?.id;
+      let targetListIds: string[] = [];
+      if ((campaign as any).listIds && (campaign as any).listIds.length > 0) {
+        targetListIds = (campaign as any).listIds;
+      } else if (campaign.listId) {
+        targetListIds = [campaign.listId];
+      }
+
+      if (targetListIds.length > 0 && sequenceId) {
+        const lists = await prisma.list.findMany({
+          where: { id: { in: targetListIds }, userId: user.userId },
+          include: {
+            members: {
+              include: {
+                contact: {
+                  include: { emails: true }
+                }
+              }
+            }
+          }
+        });
+
+        const allMembers = lists.flatMap(l => l.members);
+        const allEmails = allMembers
+          .flatMap((m) => m.contact?.emails || [])
+          .map((e) => (e.normalizedEmail || e.email || '').toLowerCase())
+          .filter(Boolean);
+
+        const suppressions = await prisma.suppressionList.findMany({
+          where: { normalizedEmail: { in: allEmails } }
+        });
+        const suppressionSet = new Set(suppressions.map((s) => s.normalizedEmail.toLowerCase()));
+
+        const eligibleIds: string[] = [];
+        const seenEmails = new Set<string>();
+        const seenContactIds = new Set<string>();
+
+        for (const member of allMembers) {
+          const contact = member.contact;
+          if (!contact || seenContactIds.has(contact.id)) continue;
+          if (contact.doNotContact || contact.unsubscribeAt) continue;
+
+          const primaryEmailObj = contact.emails.find((e) => e.isPrimary) || contact.emails[0];
+          if (!primaryEmailObj) continue;
+          const normEmail = primaryEmailObj.normalizedEmail?.toLowerCase() || primaryEmailObj.email?.toLowerCase();
+          if (!normEmail || !normEmail.includes('@')) continue;
+          if (primaryEmailObj.isValid === false || primaryEmailObj.verificationStatus === 'invalid' || primaryEmailObj.verificationStatus === 'bounced' || primaryEmailObj.verificationStatus === 'soft_bounced') continue;
+          if (seenEmails.has(normEmail) || suppressionSet.has(normEmail)) continue;
+
+          seenContactIds.add(contact.id);
+          seenEmails.add(normEmail);
+          eligibleIds.push(contact.id);
+        }
+
+        const validContacts = await prisma.contact.findMany({
+          where: {
+            id: { in: eligibleIds },
+            workspaceId: campaign.workspaceId,
+            doNotContact: false,
+            unsubscribeAt: null
+          },
+          select: { id: true }
+        });
+
+        for (const c of validContacts) {
+          await prisma.enrollment.upsert({
+            where: {
+              campaignId_contactId: {
+                campaignId: campaign.id,
+                contactId: c.id
+              }
+            },
+            update: {},
+            create: {
+              campaignId: campaign.id,
+              sequenceId,
+              contactId: c.id,
+              status: 'pending',
+              nextSendAt: campaign.startAt || new Date()
+            }
+          });
+          pendingCount++;
+        }
+      }
+    }
+
+    // Check total enrollments if pendingCount is still 0
+    if (pendingCount === 0) {
+      const totalEnrollmentsCount = await prisma.enrollment.count({
+        where: { campaignId: campaign.id }
+      });
+      if (totalEnrollmentsCount === 0) {
+        res.status(400).json({ error: 'No validated recipients found in the selected audience list(s).' });
+        return;
+      }
     }
 
     const now = new Date();
@@ -1161,7 +1425,7 @@ export const launchBulkCampaign = async (req: Request, res: Response): Promise<v
     });
   } catch (error: any) {
     console.error('Error in launchBulkCampaign:', error);
-    res.status(500).json({ error: 'Failed to launch bulk campaign' });
+    res.status(500).json({ error: error?.message || 'Failed to launch bulk campaign' });
   }
 };
 
@@ -1488,6 +1752,7 @@ export const getBulkCampaignRecipients = async (req: Request, res: Response): Pr
       const msg = enr.messages?.[0] || null;
 
       return {
+        id: enr.id,
         enrollmentId: enr.id,
         contactId: contact?.id,
         firstName: contact?.firstName || '',
@@ -1497,6 +1762,7 @@ export const getBulkCampaignRecipients = async (req: Request, res: Response): Pr
         companyName: contact?.organization?.name || '',
         jobTitle: contact?.jobTitle || '',
         status: enr.status, // pending, sending, sent, delivered, soft_bounced, bounced, replied, unsubscribed, failed
+        currentStep: enr.currentStep || 1,
         assignedMailbox: enr.mailbox?.email || null,
         sentAt: msg?.sentAt || enr.lastSentAt || null,
         openedAt: msg?.openedAt || null,

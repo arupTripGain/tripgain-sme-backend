@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -189,6 +189,7 @@ app.put('/api/bulk-campaigns/:id', authenticateToken, updateBulkCampaign);
 app.delete('/api/bulk-campaigns/:id', authenticateToken, deleteBulkCampaign);
 app.get('/api/bulk-campaigns/:id/preflight', authenticateToken, getBulkCampaignPreflight);
 app.post('/api/bulk-campaigns/:id/send-test', authenticateToken, sendBulkTestEmail);
+app.post('/api/bulk-campaigns/:id/test-email', authenticateToken, sendBulkTestEmail);
 app.post('/api/bulk-campaigns/:id/queue', authenticateToken, queueBulkCampaign);
 app.post('/api/bulk-campaigns/:id/launch', authenticateToken, launchBulkCampaign);
 app.post('/api/bulk-campaigns/:id/pause', authenticateToken, pauseBulkCampaign);
@@ -232,6 +233,24 @@ app.post('/api/mailboxes/:id/test', authenticateToken, testMailbox);
 app.post('/api/mailboxes/:id/send-test', authenticateToken, sendTestEmail);
 app.get('/api/integrations/google/callback', googleCallback);
 app.get('/api/integrations/microsoft/callback', microsoftCallback);
+
+// API 404 fallback - Ensure all /api routes ALWAYS return JSON, never HTML
+app.use('/api', (req: Request, res: Response) => {
+  res.status(404).json({
+    error: `API route not found: ${req.method} ${req.originalUrl}`
+  });
+});
+
+// Global API error handler - Ensure unhandled errors return JSON, never HTML
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error('[API Unhandled Error]:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error'
+  });
+});
 
 if (!process.env.VERCEL) {
   app.listen(port, () => {
