@@ -846,26 +846,37 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Pick first available sender mailbox
-    const senderRef = campaign.senderMailboxes?.[0];
-    if (!senderRef) {
-      res.status(400).json({ error: 'No sender mailbox configured for this campaign' });
-      return;
+    // Pick requested or first available sender mailbox
+    const senderRef = req.body.mailboxId || req.body.senderMailbox || campaign.senderMailboxes?.[0];
+    let mailbox: any = null;
+
+    if (senderRef) {
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
+          OR: [
+            { id: senderRef },
+            { email: senderRef }
+          ],
+          userId: user.userId
+        },
+        include: { credentials: true, workspace: true }
+      });
     }
 
-    const mailbox = await prisma.mailbox.findFirst({
-      where: {
-        OR: [
-          { id: senderRef },
-          { email: senderRef }
-        ],
-        userId: user.userId
-      },
-      include: { credentials: true, workspace: true }
-    });
+    if (!mailbox) {
+      // Fallback: pick any active connected mailbox belonging to this user
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
+          userId: user.userId,
+          status: 'CONNECTED',
+          isActive: true
+        },
+        include: { credentials: true, workspace: true }
+      });
+    }
 
     if (!mailbox) {
-      res.status(400).json({ error: `Mailbox ${senderRef} not found` });
+      res.status(400).json({ error: 'No active connected sender mailbox found for this account' });
       return;
     }
 
@@ -1032,8 +1043,7 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
         const isSyntheticTest = target.recipientEmail.endsWith('.test') ||
           target.recipientEmail.endsWith('.local') ||
           target.recipientEmail.includes('safe-tester') ||
-          target.recipientEmail.includes('example.com') ||
-          !transporter;
+          target.recipientEmail.includes('example.com');
 
         if (isSyntheticTest) {
           const fakeMsgId = `<tg_test_${crypto.randomUUID()}@${mailbox.email.split('@')[1] || 'tripgain.local'}>`;
@@ -1047,6 +1057,11 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             messageId: fakeMsgId,
             renderedSubject
           });
+        } else {
+          if (!transporter) {
+            throw new Error(`Mailbox ${mailbox.email} does not have SMTP credentials configured to send live test emails.`);
+          }
+
           const styledTestHtml = `<!DOCTYPE html>
 <html>
   <head>
