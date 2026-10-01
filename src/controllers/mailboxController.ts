@@ -534,20 +534,7 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const bounds = getCalendarBucketBounds(new Date(), fullMailbox.sendingTimezone || 'Asia/Kolkata');
-    const bucketCounts = await getDispatchedMessageCounts({
-      mailboxEmail: fullMailbox.email,
-      startOfHour: bounds.startOfHour,
-      endOfHour: bounds.endOfHour,
-      startOfDay: bounds.startOfDay,
-      endOfDay: bounds.endOfDay
-    });
-
-    if (bucketCounts.mailboxSentToday >= fullMailbox.dailySendLimit) {
-      res.status(429).json({ error: `Cannot send test email: Mailbox daily sending limit (${fullMailbox.dailySendLimit}) has been reached for today.` });
-      return;
-    }
-
+    // Manual test emails bypass all daily/hourly limits and send directly
     const smtpHost = fullMailbox.credentials.encryptedSmtpHost ? decrypt(fullMailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
     const smtpPort = fullMailbox.credentials.encryptedSmtpPort ? Number(decrypt(fullMailbox.credentials.encryptedSmtpPort)) : 465;
     const smtpUser = fullMailbox.credentials.encryptedSmtpUsername ? decrypt(fullMailbox.credentials.encryptedSmtpUsername) : fullMailbox.email;
@@ -590,12 +577,10 @@ export const sendTestEmail = async (req: Request, res: Response): Promise<void> 
       `
     });
 
-    // Synchronize mailbox sent counters with dynamic ground truth
+    // Update lastSentAt timestamp without consuming daily campaign sending quota
     await prisma.mailbox.update({
       where: { id },
       data: {
-        emailsSentToday: bucketCounts.mailboxSentToday + 1,
-        emailsSentThisHour: bucketCounts.mailboxSentThisHour + 1,
         lastSentAt: new Date()
       }
     });

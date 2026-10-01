@@ -43,7 +43,7 @@ import { createContact, getContacts, getContactById, bulkImportContacts, deleteC
 import { personalizeContact, editPersonalization, startBulkPersonalization, getBulkJobStatus, getListPersonalizationStats } from './controllers/personalizationController';
 import { createOrganization, getOrganizations } from './controllers/organizationController';
 import { createList, getLists, getListById, deleteList, addMembersToList, removeMembersFromList, updateList, duplicateList } from './controllers/listController';
-import { getCampaigns, getCampaignById, composeCampaign, activateCampaign, pauseCampaign, duplicateCampaign, getCampaignLeads, updateCampaign, updateCampaignSteps, generateLeadDraft, updateEnrollmentStatus, enrollLeads, getCampaignAuditLogs, getEligibilityPreview, deleteCampaign } from './controllers/campaignController';
+import { getCampaigns, getCampaignById, composeCampaign, activateCampaign, pauseCampaign, duplicateCampaign, getCampaignLeads, updateCampaign, updateCampaignSteps, generateLeadDraft, updateEnrollmentStatus, enrollLeads, getCampaignAuditLogs, getEligibilityPreview, deleteCampaign, sendCampaignTestEmail } from './controllers/campaignController';
 import { 
   getCampaignAnalytics, 
   getCampaignStepAnalytics, 
@@ -126,6 +126,8 @@ app.get('/api/campaigns/:id/leads', authenticateToken, getCampaignLeads);
 app.put('/api/campaigns/:id', authenticateToken, updateCampaign);
 app.put('/api/campaigns/:id/steps', authenticateToken, updateCampaignSteps);
 app.post('/api/campaigns/draft', authenticateToken, generateLeadDraft);
+app.post('/api/campaigns/test-email', authenticateToken, sendCampaignTestEmail);
+app.post('/api/campaigns/:id/test-email', authenticateToken, sendCampaignTestEmail);
 app.delete('/api/campaigns/:id', authenticateToken, deleteCampaign);
 
 import { handleRedirect, handleOpenTracking, handleUnsubscribe } from './controllers/trackingController';

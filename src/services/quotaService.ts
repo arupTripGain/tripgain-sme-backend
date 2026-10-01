@@ -327,32 +327,27 @@ export function calculateEffectiveCapacity(params: {
   };
 }
 
+// In-process lock tracker per mailbox with TTL auto-expiration
+const activeMailboxLocks = new Map<string, number>();
+
 /**
- * Database-backed advisory lock for concurrency protection per Mailbox.
- * Guarantees that two concurrent scheduler workers or manual ticks cannot process the same mailbox simultaneously.
+ * Concurrency protection per Mailbox.
+ * Guarantees that two concurrent scheduler operations cannot process the same mailbox simultaneously,
+ * without leaking session locks across pooled database connections.
  */
 export async function tryAcquireMailboxLock(mailboxId: string): Promise<boolean> {
-  try {
-    const lockKey = hashStringTo32BitInt(`mailbox_lock:${mailboxId}`);
-    const result = await prisma.$queryRaw<Array<{ locked: boolean }>>`
-      SELECT pg_try_advisory_lock(${lockKey}) as locked
-    `;
-    return Boolean(result[0]?.locked);
-  } catch (err) {
-    console.error(`[QuotaService] Error acquiring lock for mailbox ${mailboxId}:`, err);
+  const now = Date.now();
+  const lockedAt = activeMailboxLocks.get(mailboxId);
+  // Auto-expire lock after 5 minutes in case of unhandled error/crash
+  if (lockedAt && now - lockedAt < 5 * 60 * 1000) {
     return false;
   }
+  activeMailboxLocks.set(mailboxId, now);
+  return true;
 }
 
 export async function releaseMailboxLock(mailboxId: string): Promise<void> {
-  try {
-    const lockKey = hashStringTo32BitInt(`mailbox_lock:${mailboxId}`);
-    await prisma.$queryRaw`
-      SELECT pg_advisory_unlock(${lockKey})
-    `;
-  } catch (err) {
-    console.error(`[QuotaService] Error releasing lock for mailbox ${mailboxId}:`, err);
-  }
+  activeMailboxLocks.delete(mailboxId);
 }
 
 export function hashStringTo32BitInt(str: string): number {

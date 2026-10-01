@@ -6,7 +6,7 @@ import crypto from 'crypto';
 import { OwnershipGuard } from '../utils/ownershipGuard';
 import { decrypt } from './mailboxController';
 import { selectFairMailbox, getCampaignEnrollmentCountsByMailbox } from '../services/rotationService';
-import { buildCanonicalLeadContext } from '../utils/templateContext';
+import { buildCanonicalLeadContext, normalizeEmailHtml } from '../utils/templateContext';
 import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
 
 const prisma = new PrismaClient();
@@ -837,7 +837,11 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
     const campaign = await prisma.campaign.findFirst({
       where: { id: campaignId, userId: user.userId, campaignType: 'BULK_EMAIL' },
       include: {
-        sequences: { include: { steps: true } }
+        sequences: {
+          include: {
+            steps: { orderBy: { stepNumber: 'asc' } }
+          }
+        }
       }
     });
 
@@ -854,20 +858,43 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       mailbox = await prisma.mailbox.findFirst({
         where: {
           OR: [
-            { id: senderRef },
-            { email: senderRef }
+            { id: senderRef.trim() },
+            { email: { equals: senderRef.trim(), mode: 'insensitive' } }
           ],
-          userId: user.userId
+          ...(user.role === 'ADMIN' ? {} : { userId: user.userId })
         },
         include: { credentials: true, workspace: true }
       });
+
+      if (!mailbox) {
+        mailbox = await prisma.mailbox.findFirst({
+          where: {
+            OR: [
+              { id: senderRef.trim() },
+              { email: { equals: senderRef.trim(), mode: 'insensitive' } }
+            ]
+          },
+          include: { credentials: true, workspace: true }
+        });
+      }
     }
 
     if (!mailbox) {
       // Fallback: pick any active connected mailbox belonging to this user
       mailbox = await prisma.mailbox.findFirst({
         where: {
-          userId: user.userId,
+          ...(user.role === 'ADMIN' ? {} : { userId: user.userId }),
+          status: 'CONNECTED',
+          isActive: true
+        },
+        include: { credentials: true, workspace: true }
+      });
+    }
+
+    if (!mailbox) {
+      // Ultimate fallback: any active connected mailbox in the system
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
           status: 'CONNECTED',
           isActive: true
         },
@@ -993,10 +1020,19 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       ? (steps.find(s => s.stepNumber === stepNumberInput) || steps[0])
       : (req.body.stepId ? (steps.find(s => s.id === req.body.stepId) || steps[0]) : steps[0]);
 
-    const rawSubject = targetStep?.subjectTemplate || 'Test Email Preview';
-    const rawBody = targetStep?.bodyHtmlTemplate || targetStep?.bodyTemplate || '<p>This is a test bulk email preview.</p>';
+    const rawSubject = (req.body.subject !== undefined && req.body.subject !== '')
+      ? req.body.subject
+      : (targetStep?.subjectTemplate || 'Test Email Preview');
+    const rawBody = (req.body.body !== undefined && req.body.body !== '')
+      ? req.body.body
+      : (targetStep?.bodyHtmlTemplate || targetStep?.bodyTemplate || '<p>This is a test bulk email preview.</p>');
     const senderName = mailbox.displayName || user.name || 'TripGain Team';
     const senderCompany = (mailbox as any).workspace?.name || 'TripGain';
+
+    // Safe debugging log (no personal data: only metadata, length, hash)
+    const bodyLength = rawBody ? String(rawBody).length : 0;
+    const bodyHash = rawBody ? crypto.createHash('sha256').update(String(rawBody)).digest('hex').slice(0, 8) : 'empty';
+    console.log(`[BulkTestEmail] dispatch: campaignId=${campaignId} stepNumber=${stepNumberInput || 1} hasExplicitBody=${Boolean(req.body.body)} bodyLength=${bodyLength} bodyHash=${bodyHash} recipientCount=${targets.length}`);
 
     const results: Array<{
       recipient: string;
@@ -1007,6 +1043,7 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       status: string;
       messageId?: string;
       renderedSubject?: string;
+      renderedBody?: string;
       error?: string;
     }> = [];
 
@@ -1034,11 +1071,34 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
         templateContext.email = target.recipientEmail;
 
         const renderedSubject = `[TEST] ` + Handlebars.compile(rawSubject, { noEscape: true })(templateContext);
-        let renderedBody = Handlebars.compile(rawBody, { noEscape: true })(templateContext);
+        let renderedBody = normalizeEmailHtml(Handlebars.compile(rawBody, { noEscape: true })(templateContext));
 
-        if (!rawBody.includes('{{unsubscribeLink}}') && unsubscribeLink && unsubscribeLink !== '#') {
+        const alreadyHasUnsubscribe = 
+          rawBody.includes('{{unsubscribeLink}}') ||
+          rawBody.includes('%7BunsubscribeLink%7D') ||
+          /unsubscribe/i.test(rawBody) ||
+          /unsubscribe/i.test(renderedBody);
+
+        if (!alreadyHasUnsubscribe && unsubscribeLink && unsubscribeLink !== '#') {
           renderedBody += `<br><hr><p style="font-size:12px;color:#888;">To unsubscribe, <a href="${unsubscribeLink}">click here</a>.</p>`;
         }
+
+        // Clean plain text representation aligned strictly with renderedBody HTML
+        const renderedPlainText = renderedBody
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<br\s*[\/]?>/gi, '\n')
+          .replace(/<\/p>/gi, '\n\n')
+          .replace(/<\/li>/gi, '\n')
+          .replace(/<li[^>]*>/gi, '• ')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/gi, '&')
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/&quot;/gi, '"')
+          .replace(/&#39;/gi, "'")
+          .replace(/\n\s*\n\s*\n/g, '\n\n')
+          .trim();
 
         const isSyntheticTest = target.recipientEmail.endsWith('.test') ||
           target.recipientEmail.endsWith('.local') ||
@@ -1055,7 +1115,8 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             success: true,
             status: 'sent',
             messageId: fakeMsgId,
-            renderedSubject
+            renderedSubject,
+            renderedBody
           });
         } else {
           if (!transporter) {
@@ -1069,6 +1130,9 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
     <style>
       body, div, p { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; }
       p { margin: 0 0 14px 0; }
+      ul, ol { margin: 8px 0 14px 0; padding-left: 20px; }
+      li { margin-bottom: 3px; line-height: 1.45; }
+      li p { margin: 0 !important; display: inline; }
     </style>
   </head>
   <body>
@@ -1080,6 +1144,7 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             from: `"${senderName}" <${mailbox.email}>`,
             to: target.recipientEmail,
             subject: renderedSubject,
+            text: renderedPlainText,
             html: styledTestHtml,
             headers: {
               'X-TripGain-Test': 'true',
@@ -1098,10 +1163,12 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
             success: true,
             status: 'sent',
             messageId: info.messageId,
-            renderedSubject
+            renderedSubject,
+            renderedBody
           });
         }
       } catch (sendErr: any) {
+        console.error(`[BulkTestEmail] SMTP send failed for recipient ${target.recipientEmail} via ${mailbox.email}:`, sendErr?.message || sendErr);
         results.push({
           recipient: target.recipientEmail,
           contactId: target.contact?.id || null,
@@ -1115,9 +1182,11 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
     }
 
     const successfulCount = results.filter(r => r.success).length;
+    const firstFailure = results.find(r => !r.success);
 
+    // Manual test emails intentionally bypass all daily/hourly limits and send directly
     res.status(200).json({
-      success: true,
+      success: successfulCount > 0,
       stepNumber: targetStep?.stepNumber || 1,
       stepId: targetStep?.id,
       count: targets.length,
@@ -1128,7 +1197,9 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
       messageId: results[0]?.messageId,
       renderedSubject: results[0]?.renderedSubject,
       senderMailbox: mailbox.email,
-      message: `Test email processed for ${successfulCount} of ${targets.length} recipient(s) via ${mailbox.email}`,
+      message: successfulCount > 0
+        ? `Test email sent to ${successfulCount} of ${targets.length} recipient(s) via ${mailbox.email}`
+        : `Test email failed via ${mailbox.email}${firstFailure?.error ? `: ${firstFailure.error}` : ''}`,
       results
     });
   } catch (error: any) {

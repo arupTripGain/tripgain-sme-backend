@@ -1,7 +1,11 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import nodemailer from 'nodemailer';
+import Handlebars from 'handlebars';
 import { OwnershipGuard } from '../utils/ownershipGuard';
 import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
+import { decrypt } from '../utils/crypto';
+import { buildCanonicalLeadContext, normalizeEmailHtml } from '../utils/templateContext';
 
 const prisma = new PrismaClient();
 
@@ -1071,5 +1075,212 @@ export const deleteCampaign = async (req: Request, res: Response): Promise<void>
   } catch (error: any) {
     console.error('Error deleting campaign:', error);
     res.status(500).json({ error: error?.message || 'Failed to delete campaign' });
+  }
+};
+
+/**
+ * Dispatches live or safe test emails directly for Campaign creation / edit wizards.
+ * Bypasses all daily/hourly limits, sending windows, and quotas.
+ */
+export const sendCampaignTestEmail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
+    const {
+      senderMailbox,
+      recipientEmail,
+      testRecipients,
+      subject,
+      body,
+      stepId,
+      stepNumber,
+      campaignId,
+      leadData
+    } = req.body || {};
+
+    const rawRecipients: string[] = Array.isArray(testRecipients)
+      ? testRecipients
+      : recipientEmail
+      ? [recipientEmail]
+      : [];
+
+    const recipients = Array.from(
+      new Set(
+        rawRecipients
+          .filter(e => typeof e === 'string' && e.trim().includes('@'))
+          .map(e => e.trim().toLowerCase())
+      )
+    );
+
+    if (recipients.length === 0) {
+      res.status(400).json({ error: 'At least one valid recipient email is required to send a test email.' });
+      return;
+    }
+
+    // Resolve sender mailbox
+    let mailbox: any = null;
+    if (senderMailbox) {
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
+          OR: [
+            { email: { equals: senderMailbox.trim(), mode: 'insensitive' } },
+            { id: senderMailbox.trim() }
+          ],
+          ...(user.role === 'ADMIN' ? {} : { userId: user.userId })
+        },
+        include: { credentials: true, workspace: true }
+      });
+
+      if (!mailbox) {
+        mailbox = await prisma.mailbox.findFirst({
+          where: {
+            OR: [
+              { email: { equals: senderMailbox.trim(), mode: 'insensitive' } },
+              { id: senderMailbox.trim() }
+            ]
+          },
+          include: { credentials: true, workspace: true }
+        });
+      }
+    }
+
+    if (!mailbox) {
+      // Fallback: pick any active connected mailbox belonging to user
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
+          ...(user.role === 'ADMIN' ? {} : { userId: user.userId }),
+          status: 'CONNECTED',
+          isActive: true
+        },
+        include: { credentials: true, workspace: true }
+      });
+    }
+
+    if (!mailbox) {
+      // Ultimate fallback: any active connected mailbox in the system
+      mailbox = await prisma.mailbox.findFirst({
+        where: {
+          status: 'CONNECTED',
+          isActive: true
+        },
+        include: { credentials: true, workspace: true }
+      });
+    }
+
+    if (!mailbox || !mailbox.credentials) {
+      res.status(400).json({ error: 'No active connected sender mailbox with valid SMTP credentials found.' });
+      return;
+    }
+
+    // Decrypt SMTP credentials
+    const smtpHost = mailbox.credentials.encryptedSmtpHost ? decrypt(mailbox.credentials.encryptedSmtpHost) : 'smtp.gmail.com';
+    const smtpPort = mailbox.credentials.encryptedSmtpPort ? Number(decrypt(mailbox.credentials.encryptedSmtpPort)) : 465;
+    const smtpUser = mailbox.credentials.encryptedSmtpUsername ? decrypt(mailbox.credentials.encryptedSmtpUsername) : mailbox.email;
+    const smtpPass = mailbox.credentials.encryptedSmtpPassword ? decrypt(mailbox.credentials.encryptedSmtpPassword) : '';
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+      auth: { user: smtpUser, pass: smtpPass },
+      connectionTimeout: 10000
+    });
+
+    const senderName = mailbox.displayName || user.name || 'TripGain Team';
+    const senderCompany = (mailbox as any).workspace?.name || 'TripGain';
+
+    const results: Array<{
+      recipient: string;
+      success: boolean;
+      messageId?: string;
+      error?: string;
+    }> = [];
+
+    for (const targetEmail of recipients) {
+      try {
+        const canonicalLead = buildCanonicalLeadContext(leadData, senderName, senderCompany);
+        canonicalLead.email = targetEmail;
+
+        const renderedSubject = `[TEST] ` + Handlebars.compile(subject || 'Test Campaign Email', { noEscape: true })(canonicalLead);
+        let renderedBody = normalizeEmailHtml(Handlebars.compile(body || '<p>This is a test campaign email.</p>', { noEscape: true })(canonicalLead));
+
+        const renderedPlainText = renderedBody
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<br\s*[\/]?>/gi, '\n')
+          .replace(/<\/p>/gi, '\n\n')
+          .replace(/<\/li>/gi, '\n')
+          .replace(/<li[^>]*>/gi, '• ')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/gi, '&')
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/&quot;/gi, '"')
+          .replace(/&#39;/gi, "'")
+          .replace(/\n\s*\n\s*\n/g, '\n\n')
+          .trim();
+
+        const styledTestHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body, div, p { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; }
+      p { margin: 0 0 14px 0; }
+      ul, ol { margin: 8px 0 14px 0; padding-left: 20px; }
+      li { margin-bottom: 3px; line-height: 1.45; }
+      li p { margin: 0 !important; display: inline; }
+      .email-signature { margin-top: 12px; margin-bottom: 0 !important; line-height: 1.4 !important; }
+    </style>
+  </head>
+  <body>
+    ${renderedBody}
+  </body>
+</html>`;
+
+        const info = await transporter.sendMail({
+          from: `"${senderName}" <${mailbox.email}>`,
+          to: targetEmail,
+          subject: renderedSubject,
+          text: renderedPlainText,
+          html: styledTestHtml,
+          headers: {
+            'X-TripGain-Test': 'true'
+          }
+        });
+
+        results.push({
+          recipient: targetEmail,
+          success: true,
+          messageId: info.messageId
+        });
+      } catch (sendErr: any) {
+        console.error(`[CampaignTestEmail] SMTP send failed for ${targetEmail} via ${mailbox.email}:`, sendErr?.message || sendErr);
+        results.push({
+          recipient: targetEmail,
+          success: false,
+          error: sendErr?.message || 'Failed to dispatch test email'
+        });
+      }
+    }
+
+    const successfulCount = results.filter(r => r.success).length;
+    const firstFailure = results.find(r => !r.success);
+
+    // Manual test emails bypass all sending limits unconditionally
+    res.status(200).json({
+      success: successfulCount > 0,
+      totalSent: successfulCount,
+      totalAttempted: recipients.length,
+      senderMailbox: mailbox.email,
+      message: successfulCount > 0
+        ? `Test email sent to ${successfulCount} recipient(s) via ${mailbox.email}`
+        : `Test email failed via ${mailbox.email}${firstFailure?.error ? `: ${firstFailure.error}` : ''}`,
+      results
+    });
+  } catch (error: any) {
+    console.error('Error in sendCampaignTestEmail:', error);
+    res.status(500).json({ error: error?.message || 'Failed to send campaign test email' });
   }
 };

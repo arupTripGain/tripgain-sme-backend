@@ -22,6 +22,7 @@ import {
   calculateNextEligibleSendTime,
   resolveEffectiveSendingDays
 } from '../utils/businessDays';
+import { normalizeEmailHtml } from '../utils/templateContext';
 
 const prisma = new PrismaClient();
 
@@ -1166,6 +1167,7 @@ async function executeMailboxDispatch(
         } catch (err) {
           console.error('[Scheduler] Error compiling body template:', err);
         }
+        renderedBody = normalizeEmailHtml(renderedBody);
 
         // 6. Create Message Record (Pending / Dispatched)
         message = await prisma.emailMessage.create({
@@ -1267,6 +1269,9 @@ async function executeMailboxDispatch(
                 <style>
                   body, div, p { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; }
                   p { margin: 0 0 14px 0; }
+                  ul, ol { margin: 8px 0 14px 0; padding-left: 20px; }
+                  li { margin-bottom: 3px; line-height: 1.45; }
+                  li p { margin: 0 !important; display: inline; }
                 </style>
               </head>
               <body>
