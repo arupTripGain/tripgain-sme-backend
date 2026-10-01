@@ -61,7 +61,12 @@ export const getLists = async (req: Request, res: Response): Promise<void> => {
     
     // Add a default Suppression List for current user
     const suppressionCount = await prisma.suppressionList.count({
-      where: { userId: user.userId }
+      where: {
+        OR: [
+          { userId: user.userId },
+          { userId: null }
+        ]
+      }
     });
 
     formatted.push({
@@ -117,7 +122,12 @@ export const getListById = async (req: Request, res: Response): Promise<void> =>
     
     if (id === 'suppression-1') {
       const suppressions = await prisma.suppressionList.findMany({
-        where: { userId: user.userId },
+        where: {
+          OR: [
+            { userId: user.userId },
+            { userId: null }
+          ]
+        },
         orderBy: { suppressedAt: 'desc' }
       });
       res.status(200).json({
@@ -259,6 +269,58 @@ export const addMembersToList = async (req: Request, res: Response): Promise<voi
     if (!user) return;
 
     const { id } = req.params;
+
+    // Handle suppression-1 virtual system list
+    if (id === 'suppression-1') {
+      const { email, emails, contactIds, reason, notes } = req.body || {};
+      const emailsToSuppress: string[] = [];
+
+      if (typeof email === 'string' && email.trim()) {
+        emailsToSuppress.push(...email.split(/[\n,;]+/).map((e: string) => e.trim().toLowerCase()));
+      }
+      if (Array.isArray(emails)) {
+        for (const e of emails) {
+          if (typeof e === 'string' && e.trim()) {
+            emailsToSuppress.push(...e.split(/[\n,;]+/).map((x: string) => x.trim().toLowerCase()));
+          }
+        }
+      }
+      if (Array.isArray(contactIds) && contactIds.length > 0) {
+        const contacts = await prisma.contact.findMany({
+          where: { id: { in: contactIds }, userId: user.userId },
+          include: { emails: true }
+        });
+        for (const c of contacts) {
+          const primary = c.emails.find(e => e.isPrimary)?.email || c.emails[0]?.email;
+          if (primary) emailsToSuppress.push(primary.toLowerCase().trim());
+        }
+      }
+
+      const validEmails = Array.from(new Set(emailsToSuppress.filter(e => e.includes('@'))));
+      if (validEmails.length === 0) {
+        res.status(400).json({ error: 'No valid email addresses provided to suppress' });
+        return;
+      }
+
+      for (const norm of validEmails) {
+        await prisma.suppressionList.upsert({
+          where: { normalizedEmail: norm },
+          update: { reason: reason || 'do_not_contact', notes, suppressedAt: new Date() },
+          create: {
+            email: norm,
+            normalizedEmail: norm,
+            reason: reason || 'do_not_contact',
+            source: 'manual_suppression',
+            notes,
+            userId: user.userId
+          }
+        });
+      }
+
+      res.status(200).json({ success: true, addedCount: validEmails.length });
+      return;
+    }
+
     const { contactIds } = req.body;
     
     if (!Array.isArray(contactIds) || contactIds.length === 0) {
@@ -308,7 +370,34 @@ export const addMembersToList = async (req: Request, res: Response): Promise<voi
 
 export const removeMembersFromList = async (req: Request, res: Response): Promise<void> => {
   try {
+    const user = OwnershipGuard.requireUser(req, res);
+    if (!user) return;
+
     const { id } = req.params;
+
+    // Handle suppression-1 virtual system list
+    if (id === 'suppression-1') {
+      const { contactIds, ids, email } = req.body || {};
+      const targetIds = Array.isArray(ids) ? ids : (Array.isArray(contactIds) ? contactIds : []);
+      if (typeof email === 'string' && email.trim()) {
+        targetIds.push(email.trim().toLowerCase());
+      }
+
+      if (targetIds.length > 0) {
+        await prisma.suppressionList.deleteMany({
+          where: {
+            OR: [
+              { id: { in: targetIds } },
+              { normalizedEmail: { in: targetIds.map((x: string) => x.toLowerCase().trim()) } }
+            ],
+            userId: user.userId
+          }
+        });
+      }
+      res.status(200).json({ success: true });
+      return;
+    }
+
     const { contactIds } = req.body;
     
     if (!Array.isArray(contactIds) || contactIds.length === 0) {

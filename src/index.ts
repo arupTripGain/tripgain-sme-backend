@@ -57,6 +57,7 @@ import { getDashboardStats, getSendingQueueSummary } from './controllers/dashboa
 import { runTick, runImapSync } from './controllers/schedulerController';
 import { processEmailScheduler } from './services/schedulerService';
 import { getMailboxes, connectSmtpImap, disconnectMailbox, testMailbox, sendTestEmail, updateMailboxLimits, googleCallback, microsoftCallback } from './controllers/mailboxController';
+import { getSuppressionList, addSuppression, removeSuppression } from './controllers/suppressionController';
 import { login, register, getMe, getUsers, deleteUser } from './controllers/authController';
 import { authenticateToken, optionalAuth } from './middleware/authMiddleware';
 
@@ -197,6 +198,11 @@ app.post('/api/bulk-campaigns/:id/resume', authenticateToken, resumeBulkCampaign
 app.post('/api/bulk-campaigns/:id/cancel', authenticateToken, cancelBulkCampaign);
 app.get('/api/bulk-campaigns/:id/analytics', authenticateToken, getBulkCampaignAnalytics);
 app.get('/api/bulk-campaigns/:id/recipients', authenticateToken, getBulkCampaignRecipients);
+
+// Suppression List Management (Strictly authenticated & user-isolated)
+app.get('/api/suppression', authenticateToken, getSuppressionList);
+app.post('/api/suppression', authenticateToken, addSuppression);
+app.delete('/api/suppression/:id', authenticateToken, removeSuppression);
 
 // Phase 6 Engine & Tracking
 app.get('/api/scheduler/tick', runTick);
