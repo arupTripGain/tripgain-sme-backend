@@ -5,7 +5,7 @@ import Handlebars from 'handlebars';
 import { OwnershipGuard } from '../utils/ownershipGuard';
 import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
 import { decrypt } from '../utils/crypto';
-import { buildCanonicalLeadContext, normalizeEmailHtml } from '../utils/templateContext';
+import { buildCanonicalLeadContext, normalizeEmailHtml, safeRenderTemplate } from '../utils/templateContext';
 
 const prisma = new PrismaClient();
 
@@ -1202,8 +1202,8 @@ export const sendCampaignTestEmail = async (req: Request, res: Response): Promis
         const canonicalLead = buildCanonicalLeadContext(leadData, senderName, senderCompany);
         canonicalLead.email = targetEmail;
 
-        const renderedSubject = `[TEST] ` + Handlebars.compile(subject || 'Test Campaign Email', { noEscape: true })(canonicalLead);
-        let renderedBody = normalizeEmailHtml(Handlebars.compile(body || '<p>This is a test campaign email.</p>', { noEscape: true })(canonicalLead));
+        const renderedSubject = `[TEST] ` + safeRenderTemplate(subject, canonicalLead, 'Test Campaign Email');
+        let renderedBody = normalizeEmailHtml(safeRenderTemplate(body, canonicalLead, '<p>This is a test campaign email.</p>'));
 
         const renderedPlainText = renderedBody
           .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')

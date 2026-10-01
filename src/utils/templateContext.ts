@@ -1,3 +1,5 @@
+import Handlebars from 'handlebars';
+
 /**
  * Builds a canonical variable resolution context from a contact or enrollment record.
  * Guarantees identical variable resolution between Preview, Test Email, and Campaign Dispatch.
@@ -186,3 +188,92 @@ export function normalizeEmailHtml(html: string): string {
 
   return clean;
 }
+
+/**
+ * Sanitizes template strings before Handlebars compilation:
+ * 1. Replaces all non-breaking spaces (&nbsp;, &#160;, \u00A0) with standard spaces.
+ * 2. Decodes common entities that may have leaked inside {{...}} blocks.
+ * 3. Strips HTML tags injected inside {{...}} by rich text editors (e.g. {{<span>firstName</span>}}).
+ * 4. Normalizes Handlebars helper blocks (e.g. {{#if&nbsp;var}} -> {{#if var}}).
+ */
+export function sanitizeHandlebarsTemplate(raw: string): string {
+  if (!raw) return '';
+
+  let text = raw;
+
+  // 1. Replace non-breaking spaces across the whole document
+  text = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&#160;/gi, ' ')
+    .replace(/&#xA0;/gi, ' ')
+    .replace(/\u00A0/g, ' ');
+
+  // 2. Decode entities inside handlebars tags
+  text = text
+    .replace(/&#125;/g, '}')
+    .replace(/&#x7D;/gi, '}')
+    .replace(/&#123;/g, '{')
+    .replace(/&#x7B;/gi, '{');
+
+  // 3. Clean inside {{ ... }} blocks: strip rogue HTML formatting tags and normalize whitespace
+  text = text.replace(/\{\{([^{}]+)\}\}/g, (_match, inner) => {
+    // Strip HTML tags inside tag
+    let cleaned = inner.replace(/<[^>]+>/g, '').trim();
+    // Normalize any residual whitespace or &nbsp; inside the tag
+    cleaned = cleaned.replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ');
+    return `{{${cleaned}}}`;
+  });
+
+  return text;
+}
+
+/**
+ * Compiles and renders a template string with Handlebars safely.
+ * If Handlebars parsing fails due to user syntax error or malformed blocks,
+ * falls back to regex-based variable replacement without throwing an unhandled parse error.
+ */
+export function safeRenderTemplate(
+  templateStr: string,
+  context: Record<string, any>,
+  fallbackDefault: string = ''
+): string {
+  const sanitized = sanitizeHandlebarsTemplate(templateStr || fallbackDefault);
+  if (!sanitized) return fallbackDefault;
+
+  try {
+    const compiled = Handlebars.compile(sanitized, { noEscape: true });
+    return compiled(context);
+  } catch (err: any) {
+    console.warn('[TemplateEngine] Handlebars compilation failed, applying resilient fallback:', err?.message);
+    let fallbackText = sanitized;
+    try {
+      // Resolve {{#if key}}...{{else}}...{{/if}}
+      fallbackText = fallbackText.replace(
+        /\{\{#if\s+([a-zA-Z0-9_]+)\}\}([\s\S]*?)\{\{else\}\}([\s\S]*?)\{\{\/if\}\}/gi,
+        (_, key, truthy, falsy) => {
+          const val = context[key];
+          return val && String(val).trim() !== '' ? truthy : falsy;
+        }
+      );
+      // Resolve {{#if key}}...{{/if}}
+      fallbackText = fallbackText.replace(
+        /\{\{#if\s+([a-zA-Z0-9_]+)\}\}([\s\S]*?)\{\{\/if\}\}/gi,
+        (_, key, content) => {
+          const val = context[key];
+          return val && String(val).trim() !== '' ? content : '';
+        }
+      );
+      // Resolve {{key}}
+      fallbackText = fallbackText.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
+        const val = context[key];
+        return val !== undefined && val !== null ? String(val) : '';
+      });
+      // Strip any unhandled residual {{...}}
+      fallbackText = fallbackText.replace(/\{\{[^}]+\}\}/g, '');
+      return fallbackText;
+    } catch {
+      return sanitized;
+    }
+  }
+}
+

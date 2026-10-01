@@ -22,7 +22,7 @@ import {
   calculateNextEligibleSendTime,
   resolveEffectiveSendingDays
 } from '../utils/businessDays';
-import { normalizeEmailHtml } from '../utils/templateContext';
+import { normalizeEmailHtml, safeRenderTemplate } from '../utils/templateContext';
 
 const prisma = new PrismaClient();
 
@@ -1135,28 +1135,8 @@ async function executeMailboxDispatch(
           const cleanThreadSubject = threadSubject.replace(/^(Re:\s*)+/i, '').trim();
           renderedSubject = `Re: ${cleanThreadSubject}`;
         } else if (renderedSubject) {
-          try {
-            const template = Handlebars.compile(renderedSubject);
-            const contactAny = contact as any;
-            renderedSubject = template({
-              name: contactAny?.name || `${contact?.firstName || ''} ${contact?.lastName || ''}`.trim(),
-              firstName: contact?.firstName || contactAny?.name?.split(' ')[0] || '',
-              lastName: contact?.lastName || '',
-              email: primaryEmail,
-              company: contact?.organization?.name || '',
-              ...(contactAny?.customFields || {})
-            });
-          } catch (err) {
-            console.error('[Scheduler] Error compiling subject template:', err);
-          }
-        }
-
-        // Render Body
-        let renderedBody = rawBody;
-        try {
-          const template = Handlebars.compile(rawBody);
           const contactAny = contact as any;
-          renderedBody = template({
+          renderedSubject = safeRenderTemplate(renderedSubject, {
             name: contactAny?.name || `${contact?.firstName || ''} ${contact?.lastName || ''}`.trim(),
             firstName: contact?.firstName || contactAny?.name?.split(' ')[0] || '',
             lastName: contact?.lastName || '',
@@ -1164,10 +1144,20 @@ async function executeMailboxDispatch(
             company: contact?.organization?.name || '',
             ...(contactAny?.customFields || {})
           });
-        } catch (err) {
-          console.error('[Scheduler] Error compiling body template:', err);
         }
-        renderedBody = normalizeEmailHtml(renderedBody);
+
+        // Render Body
+        const contactAny = contact as any;
+        let renderedBody = normalizeEmailHtml(
+          safeRenderTemplate(rawBody, {
+            name: contactAny?.name || `${contact?.firstName || ''} ${contact?.lastName || ''}`.trim(),
+            firstName: contact?.firstName || contactAny?.name?.split(' ')[0] || '',
+            lastName: contact?.lastName || '',
+            email: primaryEmail,
+            company: contact?.organization?.name || '',
+            ...(contactAny?.customFields || {})
+          })
+        );
 
         // 6. Create Message Record (Pending / Dispatched)
         message = await prisma.emailMessage.create({

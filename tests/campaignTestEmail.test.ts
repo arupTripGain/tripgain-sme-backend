@@ -105,3 +105,43 @@ test('Campaign Test Email - Controller Dispatch and Variable Resolution', async 
     (nodemailer as any).createTransport = originalCreateTransport;
   }
 });
+
+test('Campaign Test Email - Handles &nbsp; inside Handlebars tags and resilient fallback', async () => {
+  const user = await prisma.user.findFirst({ where: { role: 'ADMIN' } });
+  const mailbox = await prisma.mailbox.findFirst({ where: { status: 'CONNECTED', isActive: true } });
+  const token = jwt.sign({ userId: user!.id, email: user!.email, role: user!.role }, JWT_SECRET);
+
+  const sentMails: any[] = [];
+  const originalCreateTransport = nodemailer.createTransport;
+  (nodemailer as any).createTransport = () => ({
+    sendMail: async (mailOptions: any) => {
+      sentMails.push(mailOptions);
+      return { messageId: '<test-nbsp-msg-id@domain.com>' };
+    }
+  });
+
+  try {
+    const { req, res } = createMockReqRes({
+      token,
+      user: { userId: user!.id, email: user!.email, role: user!.role },
+      body: {
+        senderMailbox: mailbox!.email,
+        testRecipients: ['tester@tripgain.com'],
+        subject: 'Hello&nbsp;{{#if&nbsp;firstName}}{{firstName}}{{/if}}',
+        body: '<p>Hi&nbsp;{{#if&nbsp;firstName}}{{firstName}}{{else}}there{{/if}},</p><p>Testing nbsp sanitization.</p>',
+        leadData: { firstName: 'Vikram', email: 'tester@tripgain.com' }
+      }
+    });
+
+    await sendCampaignTestEmail(req, res);
+
+    assert.strictEqual(res.getStatusCode(), 200, 'Should return HTTP 200 even with nbsp in Handlebars tags');
+    const data = res.getResponseData();
+    assert.strictEqual(data.success, true, 'Dispatch must succeed');
+    assert.strictEqual(sentMails.length, 1);
+    assert.ok(sentMails[0].html.includes('Hi Vikram,'), 'Must render firstName through nbsp helper block');
+  } finally {
+    (nodemailer as any).createTransport = originalCreateTransport;
+  }
+});
+

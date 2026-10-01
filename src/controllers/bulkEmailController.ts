@@ -6,7 +6,7 @@ import crypto from 'crypto';
 import { OwnershipGuard } from '../utils/ownershipGuard';
 import { decrypt } from './mailboxController';
 import { selectFairMailbox, getCampaignEnrollmentCountsByMailbox } from '../services/rotationService';
-import { buildCanonicalLeadContext, normalizeEmailHtml } from '../utils/templateContext';
+import { buildCanonicalLeadContext, normalizeEmailHtml, safeRenderTemplate } from '../utils/templateContext';
 import { calculateCampaignStepProgressAndCompletion } from '../services/campaignProgressService';
 
 const prisma = new PrismaClient();
@@ -1070,8 +1070,8 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
         const templateContext = buildCanonicalLeadContext(target.contact, senderName, senderCompany, unsubscribeLink);
         templateContext.email = target.recipientEmail;
 
-        const renderedSubject = `[TEST] ` + Handlebars.compile(rawSubject, { noEscape: true })(templateContext);
-        let renderedBody = normalizeEmailHtml(Handlebars.compile(rawBody, { noEscape: true })(templateContext));
+        const renderedSubject = `[TEST] ` + safeRenderTemplate(rawSubject, templateContext, 'Test Email');
+        let renderedBody = normalizeEmailHtml(safeRenderTemplate(rawBody, templateContext, '<p>Test email body</p>'));
 
         const alreadyHasUnsubscribe = 
           rawBody.includes('{{unsubscribeLink}}') ||
