@@ -40,6 +40,7 @@ app.get('/health', (req, res) => {
 });
 
 import { createContact, getContacts, getContactById, bulkImportContacts, deleteContact, bulkDeleteContacts, updateContact, exportContacts, revalidateSoftBounceContact } from './controllers/contactController';
+import { smartParseLead, smartAddLead } from './controllers/smartLeadController';
 import { personalizeContact, editPersonalization, startBulkPersonalization, getBulkJobStatus, getListPersonalizationStats } from './controllers/personalizationController';
 import { createOrganization, getOrganizations } from './controllers/organizationController';
 import { createList, getLists, getListById, deleteList, addMembersToList, removeMembersFromList, updateList, duplicateList } from './controllers/listController';
@@ -75,6 +76,8 @@ app.post('/api/auth/users', authenticateToken, register);
 app.delete('/api/auth/users/:id', authenticateToken, deleteUser);
 
 // Contact routes (Strictly authenticated & user-isolated)
+app.post('/api/contacts/smart-parse', authenticateToken, smartParseLead);
+app.post('/api/contacts/smart-add', authenticateToken, smartAddLead);
 app.post('/api/contacts/bulk-personalize', authenticateToken, startBulkPersonalization);
 app.get('/api/contacts/personalization-jobs/:jobId', authenticateToken, getBulkJobStatus);
 app.post('/api/contacts/:id/personalize', authenticateToken, personalizeContact);
