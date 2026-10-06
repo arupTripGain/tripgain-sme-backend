@@ -38,8 +38,10 @@ export interface SmartLeadDuplicateCheckResult {
     id: string;
     fullName: string | null;
     email: string | null;
+    phone?: string | null;
     jobTitle: string | null;
     companyName: string | null;
+    city?: string | null;
     linkedinUrl: string | null;
   } | null;
   existingListIds: string[];
@@ -60,6 +62,7 @@ export async function findDuplicateContact(
     firstName?: string | null;
     lastName?: string | null;
     companyName?: string | null;
+    city?: string | null;
     websiteUrl?: string | null;
   }
 ): Promise<SmartLeadDuplicateCheckResult> {
@@ -96,8 +99,10 @@ export async function findDuplicateContact(
           id: c.id,
           fullName: c.fullName || `${c.firstName || ''} ${c.lastName || ''}`.trim() || null,
           email: emailRecord.email,
+          phone: c.phone || null,
           jobTitle: c.jobTitle,
           companyName: c.organization?.name || null,
+          city: c.city || null,
           linkedinUrl: c.linkedinUrl
         },
         existingListIds: c.listMemberships.map(m => m.listId)
@@ -132,8 +137,10 @@ export async function findDuplicateContact(
           id: linkedinContact.id,
           fullName: linkedinContact.fullName,
           email: primaryEmail,
+          phone: linkedinContact.phone || null,
           jobTitle: linkedinContact.jobTitle,
           companyName: linkedinContact.organization?.name || null,
+          city: linkedinContact.city || null,
           linkedinUrl: linkedinContact.linkedinUrl
         },
         existingListIds: linkedinContact.listMemberships.map(m => m.listId)
@@ -174,8 +181,10 @@ export async function findDuplicateContact(
           id: contactWithOrg.id,
           fullName: contactWithOrg.fullName,
           email: primaryEmail,
+          phone: contactWithOrg.phone || null,
           jobTitle: contactWithOrg.jobTitle,
           companyName: contactWithOrg.organization?.name || null,
+          city: contactWithOrg.city || null,
           linkedinUrl: contactWithOrg.linkedinUrl
         },
         existingListIds: contactWithOrg.listMemberships.map(m => m.listId)
@@ -276,9 +285,11 @@ export const smartAddLead = async (req: Request, res: Response): Promise<void> =
     const fullName = (lead.fullName || `${firstName} ${lastName}`).trim();
     const jobTitle = typeof lead.jobTitle === 'string' ? lead.jobTitle.trim() : null;
     const companyName = typeof lead.companyName === 'string' ? lead.companyName.trim() : null;
+    const phone = typeof lead.phone === 'string' ? lead.phone.trim() : null;
+    const city = typeof lead.city === 'string' ? lead.city.trim() : null;
 
-    if (!cleanEmail && !fullName && !normalizedLinkedin && !companyName) {
-      res.status(400).json({ error: 'Lead does not contain recognizable name, email, or company information.' });
+    if (!cleanEmail && !fullName && !normalizedLinkedin && !companyName && !phone) {
+      res.status(400).json({ error: 'Lead does not contain recognizable name, email, phone, or company information.' });
       return;
     }
 
@@ -321,15 +332,20 @@ export const smartAddLead = async (req: Request, res: Response): Promise<void> =
           workspaceId: workspace.id,
           name: companyName || domain || 'Unknown Company',
           domain: domain || null,
-          websiteUrl: normalizedWebsite || null
+          websiteUrl: normalizedWebsite || null,
+          city: city || null
         }
       });
-    } else if (organization && normalizedWebsite && !organization.websiteUrl) {
-      // Safely update organization website if missing
-      await prisma.organization.update({
-        where: { id: organization.id },
-        data: { websiteUrl: normalizedWebsite }
-      });
+    } else if (organization) {
+      const orgUpdates: any = {};
+      if (normalizedWebsite && !organization.websiteUrl) orgUpdates.websiteUrl = normalizedWebsite;
+      if (city && !organization.city) orgUpdates.city = city;
+      if (Object.keys(orgUpdates).length > 0) {
+        await prisma.organization.update({
+          where: { id: organization.id },
+          data: orgUpdates
+        });
+      }
     }
 
     // 5. Check if contact already exists
@@ -337,7 +353,8 @@ export const smartAddLead = async (req: Request, res: Response): Promise<void> =
       email: cleanEmail || null,
       linkedinUrl: normalizedLinkedin || null,
       fullName: fullName || null,
-      companyName: companyName || null
+      companyName: companyName || null,
+      city: city || null
     });
 
     let contactId: string;
@@ -359,7 +376,9 @@ export const smartAddLead = async (req: Request, res: Response): Promise<void> =
         if (!existing.firstName && firstName) updateData.firstName = firstName;
         if (!existing.lastName && lastName) updateData.lastName = lastName;
         if (!existing.fullName && fullName) updateData.fullName = fullName;
+        if (!existing.phone && phone) updateData.phone = phone;
         if (!existing.jobTitle && jobTitle) updateData.jobTitle = jobTitle;
+        if (!existing.city && city) updateData.city = city;
         if (!existing.linkedinUrl && normalizedLinkedin) updateData.linkedinUrl = normalizedLinkedin;
         if (!existing.organizationId && organization?.id) updateData.organizationId = organization.id;
 
@@ -391,7 +410,9 @@ export const smartAddLead = async (req: Request, res: Response): Promise<void> =
         firstName: firstName || null,
         lastName: lastName || null,
         fullName: fullName || `${firstName} ${lastName}`.trim() || null,
+        phone: phone || null,
         jobTitle: jobTitle || null,
+        city: city || null,
         linkedinUrl: normalizedLinkedin || null,
         source: 'SMART_IMPORT'
       };

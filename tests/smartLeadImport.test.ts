@@ -444,8 +444,95 @@ https://www.linkedin.com/in/vikram-a-pai`;
     }
     console.log('✔ TEST 20 Passed: Second import correctly detected duplicate, reused ID, source = SMART_IMPORT.');
 
+    // ----------------------------------------------------
+    // TEST 21: User exact case (City + LinkedIn name fallback + company + email)
+    // ----------------------------------------------------
+    console.log('\n--- TEST 21: City + LinkedIn name fallback + company + email ---');
+    const input21 = `WEBSOL ENERGY SYSTEM LTD.
+Kolkata
+https://www.websolenergy.com
+https://www.linkedin.com/in/rochita-saha-b74382229
+rochitasaha2000@gmail.com`;
+
+    const res21 = parseLeadDeterministic(input21);
+    if (!res21.success) throw new Error(`Test 21 failed: ${res21.error}`);
+    if (res21.parsed.city !== 'Kolkata') throw new Error(`Expected city Kolkata, got ${res21.parsed.city}`);
+    if (res21.parsed.firstName === 'Kolkata') throw new Error(`Bug reproduced: city Kolkata was incorrectly assigned as firstName!`);
+    if (res21.parsed.fullName !== 'Rochita Saha') throw new Error(`Expected fullName Rochita Saha, got ${res21.parsed.fullName}`);
+    if (res21.parsed.companyName !== 'WEBSOL ENERGY SYSTEM LTD.') throw new Error(`Expected company WEBSOL ENERGY SYSTEM LTD., got ${res21.parsed.companyName}`);
+    if (res21.parsed.email !== 'rochitasaha2000@gmail.com') throw new Error(`Expected email rochitasaha2000@gmail.com, got ${res21.parsed.email}`);
+    if (res21.fieldStatus.city !== 'DETECTED') throw new Error(`Expected city status DETECTED, got ${res21.fieldStatus.city}`);
+    console.log('✔ TEST 21 Passed: Kolkata correctly recognized as City, Rochita Saha extracted from LinkedIn slug.');
+
+    // ----------------------------------------------------
+    // TEST 22: Ingest lead with city into database via smartAddLead
+    // ----------------------------------------------------
+    console.log('\n--- TEST 22: Ingest lead with city into database via smartAddLead ---');
+    const addReq22 = createMockReq({ lead: res21.parsed });
+    const addRes22 = createMockRes();
+    await smartAddLead(addReq22, addRes22);
+    if (addRes22.statusCode !== 201) throw new Error(`Expected 201, got ${addRes22.statusCode}: ${JSON.stringify(addRes22.data)}`);
+    const contact22 = await prisma.contact.findUnique({
+      where: { id: addRes22.data.contact.id },
+      include: { organization: true }
+    });
+    if (contact22?.city !== 'Kolkata') throw new Error(`Expected contact.city Kolkata, got ${contact22?.city}`);
+    if (contact22?.organization?.city !== 'Kolkata') throw new Error(`Expected organization.city Kolkata, got ${contact22?.organization?.city}`);
+    console.log('✔ TEST 22 Passed: City persisted to Contact and Organization records in database.');
+
+    // ----------------------------------------------------
+    // TEST 23: Complete lead with Phone Number + City + Email + Name + Title + Company
+    // ----------------------------------------------------
+    console.log('\n--- TEST 23: Complete lead with Phone Number + City ---');
+    const input23 = `khandelwaludyog1962@gmail.com
++91 9876543210
+Vikram Pai
+Founder & CEO, Khandelwal Udyog
+Kolkata
+https://kufence.com
+https://www.linkedin.com/in/vikram-a-pai`;
+
+    const res23 = parseLeadDeterministic(input23);
+    if (!res23.success) throw new Error(`Test 23 failed: ${res23.error}`);
+    if (res23.parsed.email !== 'khandelwaludyog1962@gmail.com') throw new Error(`Expected email, got ${res23.parsed.email}`);
+    if (res23.parsed.phone !== '+91 9876543210') throw new Error(`Expected phone +91 9876543210, got ${res23.parsed.phone}`);
+    if (res23.fieldStatus.phone !== 'DETECTED') throw new Error(`Expected phone status DETECTED, got ${res23.fieldStatus.phone}`);
+    if (res23.parsed.city !== 'Kolkata') throw new Error(`Expected city Kolkata, got ${res23.parsed.city}`);
+    if (res23.fieldStatus.city !== 'DETECTED') throw new Error(`Expected city status DETECTED, got ${res23.fieldStatus.city}`);
+    if (res23.parsed.fullName !== 'Vikram Pai') throw new Error(`Expected fullName Vikram Pai, got ${res23.parsed.fullName}`);
+    if (res23.parsed.jobTitle !== 'Founder & CEO') throw new Error(`Expected jobTitle Founder & CEO, got ${res23.parsed.jobTitle}`);
+    if (res23.parsed.companyName !== 'Khandelwal Udyog') throw new Error(`Expected companyName Khandelwal Udyog, got ${res23.parsed.companyName}`);
+    console.log('✔ TEST 23 Passed: Phone Number and City detected and parsed properly alongside full lead.');
+
+    // ----------------------------------------------------
+    // TEST 24: Ingest lead with Phone Number and City via smartAddLead
+    // ----------------------------------------------------
+    console.log('\n--- TEST 24: Ingest lead with Phone Number and City via smartAddLead ---');
+    const uniqueTimestamp24 = Date.now();
+    const uniqueEmail24 = `lead_phone_city_${uniqueTimestamp24}@domain.com`;
+    const lead24 = {
+      ...res23.parsed,
+      fullName: `Test Lead ${uniqueTimestamp24}`,
+      firstName: 'Test',
+      lastName: `Lead ${uniqueTimestamp24}`,
+      email: uniqueEmail24,
+      linkedinUrl: `https://www.linkedin.com/in/test-lead-${uniqueTimestamp24}`
+    };
+    const addReq24 = createMockReq({ lead: lead24 });
+    const addRes24 = createMockRes();
+    await smartAddLead(addReq24, addRes24);
+    if (addRes24.statusCode !== 201) throw new Error(`Expected 201, got ${addRes24.statusCode}: ${JSON.stringify(addRes24.data)}`);
+    const contact24 = await prisma.contact.findUnique({
+      where: { id: addRes24.data.contact.id },
+      include: { organization: true }
+    });
+    if (contact24?.phone !== '+91 9876543210') throw new Error(`Expected contact.phone +91 9876543210, got ${contact24?.phone}`);
+    if (contact24?.city !== 'Kolkata') throw new Error(`Expected contact.city Kolkata, got ${contact24?.city}`);
+    if (contact24?.organization?.city !== 'Kolkata') throw new Error(`Expected organization.city Kolkata, got ${contact24?.organization?.city}`);
+    console.log('✔ TEST 24 Passed: Phone Number and City successfully persisted to database Contact record.');
+
     console.log('\n====================================================');
-    console.log('ALL 20 SMART LEAD IMPORT TESTS PASSED SUCCESSFULLY! 🎉');
+    console.log('ALL SMART LEAD IMPORT TESTS PASSED SUCCESSFULLY! 🎉');
     console.log('====================================================');
   } finally {
     await prisma.$disconnect();
