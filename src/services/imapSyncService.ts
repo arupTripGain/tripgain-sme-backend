@@ -2,6 +2,12 @@ import { PrismaClient } from '@prisma/client';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { decrypt } from '../controllers/mailboxController';
+import {
+  findOutboundMessageByHeaders,
+  resolveProspectContact,
+  isInternalSender,
+  stopEnrollmentsOnProspectReply
+} from './replyStopService';
 
 const prisma = new PrismaClient();
 
@@ -152,8 +158,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
           const inReplyTo = parsed.inReplyTo || null;
           const receivedDate = parsed.date || new Date();
 
-          // Skip if sent by the mailbox itself (outbound)
-          if (senderEmail === mailbox.email.toLowerCase()) {
+          // Skip if sent by the mailbox itself or an internal team sender
+          if (await isInternalSender(senderEmail, mailbox.email)) {
             continue;
           }
 
@@ -221,7 +227,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                   data: {
                     status: 'bounced',
                     stoppedAt: receivedDate,
-                    stopReason: 'HARD_BOUNCE'
+                    stopReason: 'HARD_BOUNCE',
+                    nextSendAt: null
                   }
                 });
 
@@ -285,7 +292,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                   data: {
                     status: 'soft_bounced',
                     stoppedAt: receivedDate,
-                    stopReason: 'SOFT_BOUNCE'
+                    stopReason: 'SOFT_BOUNCE',
+                    nextSendAt: null
                   }
                 });
 
@@ -331,7 +339,8 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                   data: {
                     status: 'failed',
                     stoppedAt: receivedDate,
-                    stopReason: 'DELIVERY_FAILED_UNKNOWN'
+                    stopReason: 'DELIVERY_FAILED_UNKNOWN',
+                    nextSendAt: null
                   }
                 });
               }
@@ -342,116 +351,46 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
           }
 
           // ========================================================
-          // STRICT FILTER: IS THIS A REPLY TO A TRIPGAIN EMAIL?
+          // 2. PROSPECT REPLY DETECTION & THREAD CORRELATION
           // ========================================================
-          const inReplyToClean = cleanHeaderId(inReplyTo);
-          const references = (Array.isArray(parsed.references) ? parsed.references : [parsed.references])
-            .map(cleanHeaderId)
-            .filter((r): r is string => Boolean(r && r.length > 0));
+          const rawReferences = Array.isArray(parsed.references) ? parsed.references : [parsed.references];
+          const allHeaderCandidates = [inReplyTo, ...rawReferences].filter(Boolean);
 
-          const headerCandidateIds = Array.from(new Set([
-            ...(inReplyToClean ? [inReplyToClean] : []),
-            ...references
-          ]));
+          // 2A. Header correlation (searches both EmailMessage and ConversationMessage)
+          const headerMatch = await findOutboundMessageByHeaders(allHeaderCandidates, prisma);
 
-          let matchedConvId: string | null = null;
+          // 2B. Resolve prospect contact (via header correlation, direct contact emails, or aliases)
+          const resolvedContact = await resolveProspectContact(senderEmail, headerMatch, prisma);
 
-          // 1. Thread matching by In-Reply-To or References header IDs
-          if (headerCandidateIds.length > 0) {
-            const matchedOutboundMsg = await prisma.conversationMessage.findFirst({
+          let contactId = resolvedContact.contactId;
+          let matchedEnrollmentId = headerMatch.enrollmentId;
+          let matchedCampaignId = headerMatch.campaignId;
+
+          // 2C. Check if this contact has active outreach sequence enrollments
+          let activeEnrollment: any = null;
+          if (contactId) {
+            activeEnrollment = await prisma.enrollment.findFirst({
               where: {
-                direction: 'OUTBOUND',
-                OR: [
-                  { internetMessageId: { in: headerCandidateIds } },
-                  { providerMessageId: { in: headerCandidateIds } }
-                ]
+                contactId,
+                status: { in: ['active', 'pending', 'sending', 'held'] }
               },
-              select: {
-                id: true,
-                conversationId: true,
-                internetMessageId: true,
-                providerMessageId: true
-              }
-            });
-
-            if (matchedOutboundMsg?.conversationId) {
-              matchedConvId = matchedOutboundMsg.conversationId;
-            }
-          }
-
-          // 2. Targeted lookup: resolve contact by sender email
-          const senderNorm = senderEmail.trim().toLowerCase();
-          const matchedContactEmail = await prisma.contactEmail.findFirst({
-            where: { normalizedEmail: senderNorm },
-            select: {
-              id: true,
-              contactId: true,
-              contact: {
-                select: {
-                  id: true,
-                  organizationId: true
-                }
-              }
-            }
-          });
-
-          const matchedContact = matchedContactEmail?.contact || null;
-
-          // 3. Resolve active or recent enrollment for this contact
-          let matchedEnrollment: {
-            id: string;
-            campaignId: string;
-            sequenceId: string;
-          } | null = null;
-
-          if (matchedContact) {
-            matchedEnrollment = await prisma.enrollment.findFirst({
-              where: {
-                contactId: matchedContact.id,
-                status: { in: ['active', 'pending', 'sending', 'replied'] }
-              },
-              select: {
-                id: true,
-                campaignId: true,
-                sequenceId: true
-              },
+              select: { id: true, campaignId: true, sequenceId: true, mailboxId: true },
               orderBy: { createdAt: 'desc' }
             });
-
-            // 4. If conversation not matched by headers, check existing conversation for this contact
-            if (!matchedConvId) {
-              const existingContactConv = await prisma.conversation.findFirst({
-                where: {
-                  contactId: matchedContact.id,
-                  mailboxId: mailbox.id
-                },
-                select: { id: true },
-                orderBy: { latestMessageAt: 'desc' }
-              });
-
-              if (existingContactConv?.id) {
-                matchedConvId = existingContactConv.id;
-              } else {
-                // Check across all mailboxes for fallback conversation
-                const globalContactConv = await prisma.conversation.findFirst({
-                  where: { contactId: matchedContact.id },
-                  select: { id: true },
-                  orderBy: { latestMessageAt: 'desc' }
-                });
-                if (globalContactConv?.id) {
-                  matchedConvId = globalContactConv.id;
-                }
-              }
+            if (activeEnrollment && !matchedEnrollmentId) {
+              matchedEnrollmentId = activeEnrollment.id;
+              matchedCampaignId = activeEnrollment.campaignId;
             }
           }
 
-          // STRICT ENFORCEMENT:
-          // If neither a header match nor an outreach prospect -> IGNORE COMPLETELY!
-          if (!matchedConvId && !matchedContact) {
+          // STRICT FILTER:
+          // Must either correlate to an outbound outreach email OR be from an outreach contact/prospect!
+          // Unrelated messages (Google alerts, personal emails, cold pitches) are strictly ignored.
+          if (!headerMatch.matched && !contactId) {
             continue;
           }
 
-          // Check if we already imported this message into this conversation
+          // Check if we already imported this message into ConversationMessage (idempotency)
           const existingMessage = await prisma.conversationMessage.findFirst({
             where: {
               OR: [
@@ -468,36 +407,56 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
             }
           });
 
+          // Idempotency: Even if message already imported, guarantee active enrollments are stopped
           if (existingMessage) {
-            continue; // Already processed
+            if (contactId) {
+              await stopEnrollmentsOnProspectReply({
+                contactId,
+                enrollmentId: matchedEnrollmentId,
+                replyDate: receivedDate,
+                senderEmail,
+                mailboxEmail: mailbox.email,
+                internetMessageId: messageIdHeader || undefined,
+                prismaClient: prisma
+              });
+            }
+            continue;
           }
 
           // Find or create conversation
           let conversation: any = null;
-          if (matchedConvId) {
-            conversation = await prisma.conversation.findUnique({
-              where: { id: matchedConvId },
-              include: { contact: true }
+          if (contactId) {
+            conversation = await prisma.conversation.findFirst({
+              where: {
+                contactId,
+                OR: [
+                  { mailboxId: mailbox.id },
+                  ...(matchedCampaignId ? [{ campaignId: matchedCampaignId }] : [])
+                ]
+              },
+              orderBy: { latestMessageAt: 'desc' }
             });
           }
 
-          if (!conversation && matchedContact) {
+          const cleanSubject = subject || 'Re: Outreach';
+          const previewText = (bodyText || subject || 'New reply').substring(0, 100);
+
+          if (!conversation && contactId) {
             conversation = await prisma.conversation.create({
               data: {
                 mailboxId: mailbox.id,
-                contactId: matchedContact.id,
-                organizationId: matchedContact.organizationId || null,
-                campaignId: matchedEnrollment?.campaignId || null,
-                sequenceId: matchedEnrollment?.sequenceId || null,
-                enrollmentId: matchedEnrollment?.id || null,
-                subject,
+                contactId,
+                campaignId: matchedCampaignId || null,
+                sequenceId: activeEnrollment?.sequenceId || null,
+                enrollmentId: matchedEnrollmentId || null,
+                subject: cleanSubject,
                 status: 'NEEDS_ACTION',
                 priority: 'HIGH',
                 unreadCount: 1,
                 replyRequired: true,
                 interestStatus: 'INTERESTED',
                 latestMessageAt: receivedDate,
-                latestMessagePreview: (bodyText || subject).substring(0, 60) + '...',
+                latestMessagePreview: previewText,
                 latestMessageDirection: 'INBOUND',
                 lastInboundAt: receivedDate
               }
@@ -511,83 +470,50 @@ export async function syncMailboxReplies(mailboxId?: string): Promise<SyncResult
                 unreadCount: { increment: 1 },
                 replyRequired: true,
                 latestMessageAt: receivedDate,
-                latestMessagePreview: (bodyText || subject).substring(0, 60) + '...',
+                latestMessagePreview: previewText,
                 latestMessageDirection: 'INBOUND',
                 lastInboundAt: receivedDate
               }
             });
           }
 
-          if (!conversation) continue;
-
-          // Save the inbound reply message
-          await prisma.conversationMessage.create({
-            data: {
-              conversationId: conversation.id,
-              providerMessageId: messageIdHeader,
-              inReplyToMessageId: inReplyTo,
-              direction: 'INBOUND',
-              messageType: 'EMAIL',
-              senderName: senderName || senderEmail,
-              senderEmail,
-              recipientEmails: [mailbox.email],
-              subject,
-              bodyText,
-              bodyHtml,
-              isRead: false,
-              receivedAt: receivedDate
-            }
-          });
-
-          // Stop sequence on campaign enrollment if active
-          if (conversation.contactId) {
-            await prisma.enrollment.updateMany({
-              where: {
-                contactId: conversation.contactId,
-                status: { in: ['pending', 'active'] }
-              },
+          if (conversation) {
+            // Save the inbound reply message
+            await prisma.conversationMessage.create({
               data: {
-                status: 'replied',
-                stoppedAt: receivedDate,
-                stopReason: 'REPLY_RECEIVED'
+                conversationId: conversation.id,
+                providerMessageId: messageIdHeader,
+                inReplyToMessageId: inReplyTo,
+                direction: 'INBOUND',
+                messageType: 'EMAIL',
+                senderName: senderName || senderEmail,
+                senderEmail,
+                recipientEmails: [mailbox.email],
+                subject: cleanSubject,
+                bodyText,
+                bodyHtml,
+                isRead: false,
+                receivedAt: receivedDate
               }
             });
-
-            // Also update latest outbound EmailMessage and record replied EmailEvent for analytics
-            const latestOutbound = await prisma.emailMessage.findFirst({
-              where: {
-                contactId: conversation.contactId,
-                status: { in: ['sent', 'delivered', 'opened', 'clicked'] }
-              },
-              orderBy: { sentAt: 'desc' }
-            });
-
-            if (latestOutbound) {
-              await prisma.emailMessage.update({
-                where: { id: latestOutbound.id },
-                data: {
-                  status: 'replied',
-                  repliedAt: receivedDate,
-                  lastEventAt: receivedDate,
-                  deliveryConfidence: 'ENGAGEMENT_CONFIRMED'
-                }
-              });
-
-              await prisma.emailEvent.create({
-                data: {
-                  provider: 'IMAP',
-                  eventType: 'replied',
-                  emailMessageId: latestOutbound.id,
-                  contactId: conversation.contactId,
-                  campaignId: latestOutbound.campaignId,
-                  enrollmentId: latestOutbound.enrollmentId,
-                  senderEmail,
-                  recipientEmail: mailbox.email,
-                  eventAt: receivedDate
-                }
-              });
-            }
           }
+
+          // ========================================================
+          // 3. STOP ALL FUTURE SCHEDULED FOLLOW-UPS ON REPLY
+          // ========================================================
+          if (contactId) {
+            await stopEnrollmentsOnProspectReply({
+              contactId,
+              enrollmentId: matchedEnrollmentId,
+              replyDate: receivedDate,
+              senderEmail,
+              mailboxEmail: mailbox.email,
+              internetMessageId: messageIdHeader || undefined,
+              prismaClient: prisma
+            });
+          }
+
+          syncedCount++;
 
           syncedCount++;
         } catch (msgErr) {

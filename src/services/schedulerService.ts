@@ -23,6 +23,7 @@ import {
   resolveEffectiveSendingDays
 } from '../utils/businessDays';
 import { normalizeEmailHtml, safeRenderTemplate } from '../utils/templateContext';
+import { isEnrollmentStoppedDueToReply } from './replyStopService';
 
 const prisma = new PrismaClient();
 
@@ -170,8 +171,8 @@ export function calculatePacedDelaySeconds(
 // ---------------------------------------------------------------------
 // Safety Checks
 // ---------------------------------------------------------------------
-async function shouldStopBeforeSend(enrollmentId: string): Promise<{ stop: boolean; reason?: string }> {
-  const enrollment = await prisma.enrollment.findUnique({
+export async function shouldStopBeforeSend(enrollmentId: string, prismaClient: any = prisma): Promise<{ stop: boolean; reason?: string }> {
+  const enrollment = await prismaClient.enrollment.findUnique({
     where: { id: enrollmentId },
     include: { campaign: true, contact: { include: { emails: true } } }
   });
@@ -181,17 +182,25 @@ async function shouldStopBeforeSend(enrollmentId: string): Promise<{ stop: boole
 
   if (campaign.status !== "active") return { stop: true, reason: "CAMPAIGN_NOT_ACTIVE" };
   if (contact.doNotContact) return { stop: true, reason: "DO_NOT_CONTACT" };
-  if (enrollment.status === "replied") return { stop: true, reason: "REPLY_RECEIVED" };
+
+  // 1. Prospect reply check across enrollment and all contact outreach interactions
+  const replyCheck = await isEnrollmentStoppedDueToReply(enrollment.id, contact.id, prismaClient);
+  if (replyCheck.stopped) return { stop: true, reason: replyCheck.reason || "REPLY_RECEIVED" };
+
+  // 2. Terminal enrollment states
   if (enrollment.status === "unsubscribed") return { stop: true, reason: "UNSUBSCRIBED" };
-  if (enrollment.status === "bounced") return { stop: true, reason: "HARD_BOUNCE" };
+  if (enrollment.status === "bounced" || enrollment.status === "soft_bounced") return { stop: true, reason: "HARD_BOUNCE" };
   if (enrollment.status === "completed") return { stop: true, reason: "COMPLETED" };
+  if (enrollment.status === "stopped") return { stop: true, reason: enrollment.stopReason || "STOPPED" };
   
-  // Checking suppression list
-  const primaryEmail = contact.emails.find(e => e.isPrimary)?.normalizedEmail || contact.emails[0]?.normalizedEmail;
+  // 3. Checking suppression list
+  const primaryEmail = contact.emails?.find((e: any) => e.isPrimary)?.normalizedEmail || contact.emails?.[0]?.normalizedEmail;
   if (primaryEmail) {
-    const suppressed = await prisma.suppressionList.findUnique({
+    const suppressed = await (prismaClient.suppressionList.findUnique ? prismaClient.suppressionList.findUnique({
       where: { normalizedEmail: primaryEmail }
-    });
+    }) : prismaClient.suppressionList.findFirst({
+      where: { normalizedEmail: primaryEmail }
+    }));
     if (suppressed) return { stop: true, reason: "SUPPRESSED" };
   }
 
@@ -1294,6 +1303,44 @@ async function executeMailboxDispatch(
             if (parentProviderThreadId) {
               mailHeaders['X-GM-THRID'] = parentProviderThreadId;
             }
+          }
+
+          // FINAL SAFETY CHECK IMMEDIATELY BEFORE SMTP DISPATCH:
+          // Concurrency-safe re-verification that prospect has not replied while queued or reserved
+          const preFlightReplyCheck = await isEnrollmentStoppedDueToReply(enrollment.id, enrollment.contactId, prisma);
+          if (preFlightReplyCheck.stopped) {
+            console.log(
+              `[SAFETY_BLOCK] Step ${step.stepNumber} for enrollment ${enrollment.id} (contact ${enrollment.contactId}) ` +
+              `BLOCKED immediately before SMTP dispatch: prospect has replied (${preFlightReplyCheck.reason}).`
+            );
+
+            await prisma.enrollment.update({
+              where: { id: enrollment.id },
+              data: {
+                status: 'replied',
+                stoppedAt: new Date(),
+                stopReason: 'REPLY_RECEIVED',
+                nextSendAt: null
+              }
+            });
+
+            if (message?.id) {
+              await prisma.emailMessage.update({
+                where: { id: message.id },
+                data: {
+                  status: 'failed',
+                  failedAt: new Date(),
+                  failureReason: 'BLOCKED_PROSPECT_REPLIED',
+                  transportStatus: 'FAILED',
+                  smtpResponse: 'Pre-send safety block: prospect reply confirmed'
+                }
+              }).catch(() => {});
+            }
+
+            mailboxSkipped++;
+            ts.emailsSkipped++;
+            ts.safetySkipped++;
+            continue;
           }
 
           const sendResult = await transporter.sendMail({
