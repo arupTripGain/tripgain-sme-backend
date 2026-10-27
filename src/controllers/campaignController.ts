@@ -37,8 +37,8 @@ export const getCampaigns = async (req: Request, res: Response): Promise<void> =
     let whereClause: any = {
       campaignType: { not: 'BULK_EMAIL' }
     };
-    if (user.role === 'ADMIN' && scope === 'all') {
-      // Admin specifically viewing workspace-wide campaigns
+    if (scope === 'all') {
+      // Viewing workspace-wide campaigns
     } else {
       whereClause.OR = [
         { userId: user.userId },
@@ -1126,8 +1126,7 @@ export const sendCampaignTestEmail = async (req: Request, res: Response): Promis
           OR: [
             { email: { equals: senderMailbox.trim(), mode: 'insensitive' } },
             { id: senderMailbox.trim() }
-          ],
-          ...(user.role === 'ADMIN' ? {} : { userId: user.userId })
+          ]
         },
         include: { credentials: true, workspace: true }
       });
@@ -1146,10 +1145,9 @@ export const sendCampaignTestEmail = async (req: Request, res: Response): Promis
     }
 
     if (!mailbox) {
-      // Fallback: pick any active connected mailbox belonging to user
+      // Fallback: pick any active connected mailbox
       mailbox = await prisma.mailbox.findFirst({
         where: {
-          ...(user.role === 'ADMIN' ? {} : { userId: user.userId }),
           status: 'CONNECTED',
           isActive: true
         },

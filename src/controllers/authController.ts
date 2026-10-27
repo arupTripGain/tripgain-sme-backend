@@ -12,13 +12,13 @@ const getOrCreateDefaultWorkspace = async () => {
   });
   if (!workspace) {
     const adminUser = await prisma.user.upsert({
-      where: { email: 'admin@tripgain.com' },
+      where: { email: 'arup@tripgain.com' },
       update: {},
       create: {
-        email: 'admin@tripgain.com',
+        email: 'arup@tripgain.com',
         name: 'Arup Nirala',
         role: 'ADMIN',
-        passwordHash: await bcrypt.hash('password123', 10)
+        passwordHash: await bcrypt.hash('SMEoutreach@432', 10)
       }
     });
     workspace = await prisma.workspace.create({
@@ -241,10 +241,7 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.role !== 'ADMIN') {
-      res.status(403).json({ error: 'Forbidden: Admin privilege required' });
-      return;
-    }
+    // Team list accessible to all authenticated workspace users
 
     const users = await prisma.user.findMany({
       select: {

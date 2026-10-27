@@ -116,15 +116,10 @@ export class AIProviderResolver {
       }
     }
 
-    // 5. If no user key, check if user is ADMIN and platform Gemini key fallback is permitted
+    // 5. If no user key, check if platform Gemini key fallback is permitted (enabled for everyone)
     if (targetProvider === 'GEMINI') {
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { id: true, role: true }
-      });
-
       const isPlatformFallbackAllowed =
-        process.env.PLATFORM_AI_FALLBACK_ENABLED === 'true' || user?.role === 'ADMIN';
+        process.env.PLATFORM_AI_FALLBACK_ENABLED !== 'false';
 
       if (isPlatformFallbackAllowed) {
         const platformKey = getPlatformGeminiKey();

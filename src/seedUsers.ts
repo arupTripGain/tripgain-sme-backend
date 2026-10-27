@@ -11,19 +11,21 @@ export async function seedUsers() {
   
   const hashedPassword = await bcrypt.hash('password123', 10);
 
+  const arupHashedPassword = await bcrypt.hash('SMEoutreach@432', 10);
+
   // 2. Upsert Admin User (Arup Nirala)
   const admin = await prisma.user.upsert({
-    where: { email: 'admin@tripgain.com' },
+    where: { email: 'arup@tripgain.com' },
     update: {
       name: 'Arup Nirala',
       role: 'ADMIN',
-      passwordHash: hashedPassword,
+      passwordHash: arupHashedPassword,
     },
     create: {
-      email: 'admin@tripgain.com',
+      email: 'arup@tripgain.com',
       name: 'Arup Nirala',
       role: 'ADMIN',
-      passwordHash: hashedPassword,
+      passwordHash: arupHashedPassword,
     }
   });
 
@@ -79,10 +81,10 @@ export async function seedUsers() {
   });
 
   console.log('[Auth] Initial users verified:');
-  console.log(' - admin@tripgain.com (Arup Nirala, ADMIN)');
+  console.log(' - arup@tripgain.com (Arup Nirala, ADMIN)');
   console.log(' - sarah.jenkins@tripgain.com (Sarah Jenkins, MEMBER)');
   console.log(' - vikram.malhotra@tripgain.com (Vikram Malhotra, MANAGER)');
-  console.log(' - Password for all initial users: password123');
+  console.log(' - Password for Arup: SMEoutreach@432; other users: password123');
 }
 
 if (require.main === module) {

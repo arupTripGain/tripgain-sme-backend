@@ -29,8 +29,8 @@ export const getConversations = async (req: Request, res: Response): Promise<voi
       whereClause.status = tab;
     }
 
-    // User-level isolation
-    if (!(user.role === 'ADMIN' && scope === 'all')) {
+    // User-level isolation unless workspace scope requested
+    if (scope !== 'all') {
       const userMailboxes = await prisma.mailbox.findMany({
         where: { userId: user.userId },
         select: { id: true, email: true }
@@ -144,7 +144,7 @@ export const replyToConversation = async (req: Request, res: Response): Promise<
       where: { userId: user.userId, status: 'CONNECTED', isActive: true },
       include: { credentials: true }
     });
-    if (!mailbox && user.role === 'ADMIN') {
+    if (!mailbox) {
       mailbox = await prisma.mailbox.findFirst({
         where: { status: 'CONNECTED', isActive: true },
         include: { credentials: true }

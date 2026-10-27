@@ -58,8 +58,8 @@ export const getMailboxes = async (req: Request, res: Response): Promise<void> =
     const scope = req.query.scope as string | undefined;
 
     let whereClause: any = {};
-    if (user.role === 'ADMIN' && scope === 'all') {
-      // Admin requested to view all workspace mailboxes
+    if (scope === 'all') {
+      // Requested to view all workspace mailboxes
     } else {
       whereClause.userId = user.userId;
     }
@@ -241,11 +241,7 @@ export const connectSmtpImap = async (req: Request, res: Response): Promise<void
     const userId = user.userId;
     const ownerName = user.name || user.email || 'User';
 
-    const existingMailbox = await prisma.mailbox.findUnique({ where: { email: cleanEmail } });
-    if (existingMailbox && existingMailbox.userId && existingMailbox.userId !== user.userId && user.role !== 'ADMIN') {
-      res.status(403).json({ error: 'This email address is already connected by another user.' });
-      return;
-    }
+    // If mailbox already exists, update/reconnect for current user/workspace
 
     // Test SMTP Authentication
     try {

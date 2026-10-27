@@ -463,13 +463,9 @@ export class AIProviderService {
       }))
     };
 
-    // Check admin fallback status for legacy fields
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { role: true }
-    });
+    // Platform fallback available to all workspace users
     const fallbackAvailable =
-      (process.env.PLATFORM_AI_FALLBACK_ENABLED === 'true' || user?.role === 'ADMIN') &&
+      process.env.PLATFORM_AI_FALLBACK_ENABLED !== 'false' &&
       Boolean(process.env.GEMINI_API_KEY);
 
     return {

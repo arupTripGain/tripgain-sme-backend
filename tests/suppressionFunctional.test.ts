@@ -10,7 +10,13 @@ async function runSuppressionFunctionalTests() {
   console.log('====================================================\n');
 
   const testUser = await prisma.user.findFirst({
-    where: { email: 'admin@tripgain.com' }
+    where: {
+      OR: [
+        { email: 'arup@tripgain.com' },
+        { email: 'admin@tripgain.com' },
+        { role: 'ADMIN' }
+      ]
+    }
   });
 
   if (!testUser) {

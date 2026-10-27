@@ -46,15 +46,8 @@ export class OwnershipGuard {
   }
 
   static requireAdmin(req: Request, res: Response): AuthUser | null {
-    const user = this.requireUser(req, res);
-    if (!user) return null;
-
-    const role = (user.role || '').toUpperCase();
-    if (role !== 'ADMIN') {
-      res.status(403).json({ error: 'Forbidden: Lead Intelligence is restricted to administrators only.' });
-      return null;
-    }
-    return user;
+    // Open to all authenticated users (features pushed to everyone)
+    return this.requireUser(req, res);
   }
 
   static async assertCampaign(req: Request, res: Response, campaignId: string): Promise<Campaign | null> {
@@ -137,37 +130,14 @@ export class OwnershipGuard {
     const user = this.requireUser(req, res);
     if (!user) return null;
 
-    if (user.role === 'ADMIN') {
-      const conv = await prisma.conversation.findUnique({
-        where: { id: conversationId }
-      });
-      if (!conv) {
-        res.status(404).json({ error: 'Conversation not found' });
-        return null;
-      }
-      return conv;
-    }
-
-    const conversation = await prisma.conversation.findFirst({
-      where: {
-        id: conversationId,
-        OR: [
-          { campaign: { userId: user.userId } },
-          ...(user.name ? [{ campaign: { owner: user.name } }] : []),
-          ...(user.email ? [{ campaign: { owner: user.email } }] : []),
-          { mailbox: { userId: user.userId } },
-          { contact: { userId: user.userId } },
-          { assignedTo: user.userId },
-          ...(user.email ? [{ assignedTo: user.email }] : [])
-        ]
-      }
+    // Workspace conversations accessible to all authenticated users
+    const conv = await prisma.conversation.findUnique({
+      where: { id: conversationId }
     });
-
-    if (!conversation) {
+    if (!conv) {
       res.status(404).json({ error: 'Conversation not found' });
       return null;
     }
-
-    return conversation;
+    return conv;
   }
 }

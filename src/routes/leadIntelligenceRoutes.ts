@@ -1,15 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticateToken } from '../middleware/authMiddleware';
-
-const requireAdminRole = (req: Request, res: Response, next: NextFunction): void => {
-  const role = (req.user?.role || '').toUpperCase();
-  if (role !== 'ADMIN') {
-    res.status(403).json({ error: 'Forbidden: Lead Intelligence is restricted to administrators only.' });
-    return;
-  }
-  next();
-};
-
 import {
   uploadFileMiddleware,
   uploadSourceFile,
@@ -31,8 +21,8 @@ import {
 
 const router = Router();
 
-// Apply auth and admin-only role guard to all lead intelligence routes
-router.use(authenticateToken, requireAdminRole);
+// Apply auth to all lead intelligence routes (accessible to everyone)
+router.use(authenticateToken);
 
 // Research Batch Endpoints
 router.get('/batches', getBatches);

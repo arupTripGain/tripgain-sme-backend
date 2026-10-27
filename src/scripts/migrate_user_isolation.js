@@ -8,6 +8,7 @@ async function main() {
   const adminUser = await prisma.user.findFirst({
     where: {
       OR: [
+        { email: 'arup@tripgain.com' },
         { email: 'admin@tripgain.com' },
         { id: '07b35148-6de7-4ea4-8702-7b4543764ad6' }
       ]

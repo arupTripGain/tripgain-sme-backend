@@ -860,8 +860,7 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
           OR: [
             { id: senderRef.trim() },
             { email: { equals: senderRef.trim(), mode: 'insensitive' } }
-          ],
-          ...(user.role === 'ADMIN' ? {} : { userId: user.userId })
+          ]
         },
         include: { credentials: true, workspace: true }
       });
@@ -880,10 +879,9 @@ export const sendBulkTestEmail = async (req: Request, res: Response): Promise<vo
     }
 
     if (!mailbox) {
-      // Fallback: pick any active connected mailbox belonging to this user
+      // Fallback: pick any active connected mailbox
       mailbox = await prisma.mailbox.findFirst({
         where: {
-          ...(user.role === 'ADMIN' ? {} : { userId: user.userId }),
           status: 'CONNECTED',
           isActive: true
         },

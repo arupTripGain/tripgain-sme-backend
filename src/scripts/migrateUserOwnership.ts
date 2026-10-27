@@ -7,11 +7,17 @@ async function migrateUserOwnership() {
 
   // 1. Find the primary admin user
   const admin = await prisma.user.findFirst({
-    where: { email: 'admin@tripgain.com' }
+    where: {
+      OR: [
+        { email: 'arup@tripgain.com' },
+        { email: 'admin@tripgain.com' },
+        { role: 'ADMIN' }
+      ]
+    }
   });
 
   if (!admin) {
-    console.error('Admin user (admin@tripgain.com) not found!');
+    console.error('Admin user not found!');
     process.exit(1);
   }
 

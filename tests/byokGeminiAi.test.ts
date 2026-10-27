@@ -65,7 +65,13 @@ async function runBYOKTests() {
 
   // 1. Fetch test users
   const userA = await prisma.user.findFirst({
-    where: { email: 'admin@tripgain.com' }
+    where: {
+      OR: [
+        { email: 'arup@tripgain.com' },
+        { email: 'admin@tripgain.com' },
+        { role: 'ADMIN' }
+      ]
+    }
   });
   const userB = await prisma.user.findFirst({
     where: { email: 'sarah.jenkins@tripgain.com' }
